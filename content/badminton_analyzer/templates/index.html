@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Badminton Analyzer</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+      color: #1f2937;
+    }
+    .container {
+      max-width: 1000px;
+      margin: 32px auto;
+      padding: 0 16px 32px;
+    }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 28px;
+    }
+    h2 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    input[type="file"], select, button {
+      font-size: 14px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #d1d5db;
+      background: #fff;
+    }
+    button {
+      background: #0f766e;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+    button:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 14px;
+      color: #374151;
+      min-height: 20px;
+    }
+    img {
+      width: 100%;
+      max-width: 920px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
+      display: none;
+    }
+    pre {
+      background: #111827;
+      color: #e5e7eb;
+      border-radius: 10px;
+      padding: 12px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      min-height: 80px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>Badminton Video Analyzer</h1>
+      <div class="row">
+        <input id="videoInput" type="file" accept=".mp4,.mov,.m4v,.webm,.mkv,.avi">
+        <button id="uploadBtn">Upload + Detect Players</button>
+      </div>
+      <div id="uploadStatus" class="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Detected Frame</h2>
+      <img id="preview" alt="Detected frame">
+    </div>
+
+    <div class="card">
+      <h2>Single Player Analysis</h2>
+      <div class="row">
+        <select id="singlePlayer"></select>
+        <button id="analyzeBtn">Analyze Selected Player</button>
+      </div>
+      <div id="analyzeStatus" class="status"></div>
+      <pre id="singleOutput"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Compare Two Players</h2>
+      <div class="row">
+        <select id="player1"></select>
+        <select id="player2"></select>
+        <button id="compareBtn">Compare</button>
+      </div>
+      <div id="compareStatus" class="status"></div>
+      <pre id="compareOutput"></pre>
+    </div>
+  </div>
+
+  <script>
+    const videoInput = document.getElementById("videoInput");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const uploadStatus = document.getElementById("uploadStatus");
+    const preview = document.getElementById("preview");
+
+    const singlePlayer = document.getElementById("singlePlayer");
+    const analyzeBtn = document.getElementById("analyzeBtn");
+    const analyzeStatus = document.getElementById("analyzeStatus");
+    const singleOutput = document.getElementById("singleOutput");
+
+    const player1 = document.getElementById("player1");
+    const player2 = document.getElementById("player2");
+    const compareBtn = document.getElementById("compareBtn");
+    const compareStatus = document.getElementById("compareStatus");
+    const compareOutput = document.getElementById("compareOutput");
+
+    function setSelectOptions(labels) {
+      for (const select of [singlePlayer, player1, player2]) {
+        select.innerHTML = "";
+        for (const label of labels) {
+          const option = document.createElement("option");
+          option.value = label;
+          option.textContent = label;
+          select.appendChild(option);
+        }
+      }
+    }
+
+    uploadBtn.addEventListener("click", async () => {
+      const file = videoInput.files[0];
+      if (!file) {
+        uploadStatus.textContent = "Select a video file first.";
+        return;
+      }
+
+      uploadBtn.disabled = true;
+      uploadStatus.textContent = "Uploading and running player detection...";
+      singleOutput.textContent = "";
+      compareOutput.textContent = "";
+
+      const formData = new FormData();
+      formData.append("video", file);
+
+      try {
+        const response = await fetch("/detect-humans", {
+          method: "POST",
+          body: formData
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Upload failed.");
+        }
+
+        const labels = data.labels || [];
+        setSelectOptions(labels);
+        uploadStatus.textContent = `Done. Detected ${data.count} players.`;
+
+        if (data.frame) {
+          preview.src = `data:image/jpeg;base64,${data.frame}`;
+          preview.style.display = "block";
+        } else {
+          preview.style.display = "none";
+        }
+      } catch (err) {
+        uploadStatus.textContent = `Error: ${err.message}`;
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    });
+
+    analyzeBtn.addEventListener("click", async () => {
+      const player = singlePlayer.value;
+      if (!player) {
+        analyzeStatus.textContent = "No player selected.";
+        return;
+      }
+      analyzeBtn.disabled = true;
+      analyzeStatus.textContent = "Analyzing selected player...";
+      singleOutput.textContent = "";
+
+      try {
+        const response = await fetch("/analyze-player", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ player })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Analysis failed.");
+        }
+        singleOutput.textContent = data.analysis || "No analysis returned.";
+        analyzeStatus.textContent = "Analysis complete.";
+      } catch (err) {
+        analyzeStatus.textContent = `Error: ${err.message}`;
+      } finally {
+        analyzeBtn.disabled = false;
+      }
+    });
+
+    compareBtn.addEventListener("click", async () => {
+      const a = player1.value;
+      const b = player2.value;
+      if (!a || !b) {
+        compareStatus.textContent = "Pick two players.";
+        return;
+      }
+      if (a === b) {
+        compareStatus.textContent = "Choose two different players.";
+        return;
+      }
+      compareBtn.disabled = true;
+      compareStatus.textContent = "Comparing players...";
+      compareOutput.textContent = "";
+
+      try {
+        const response = await fetch("/compare-players", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ player1: a, player2: b })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Comparison failed.");
+        }
+        compareOutput.textContent = data.analysis || "No comparison returned.";
+        compareStatus.textContent = "Comparison complete.";
+      } catch (err) {
+        compareStatus.textContent = `Error: ${err.message}`;
+      } finally {
+        compareBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
