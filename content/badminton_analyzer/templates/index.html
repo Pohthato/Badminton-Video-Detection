@@ -115,6 +115,17 @@
       <div id="compareStatus" class="status"></div>
       <pre id="compareOutput"></pre>
     </div>
+
+    <div class="card">
+      <h2>Coach Chat</h2>
+      <div class="row">
+        <select id="chatPlayer"></select>
+        <input id="chatInput" type="text" placeholder="Ask a follow-up question" style="flex:1;border:1px solid #d1d5db;border-radius:8px;padding:8px;">
+        <button id="chatBtn">Ask Coach</button>
+      </div>
+      <div id="chatStatus" class="status"></div>
+      <pre id="chatOutput"></pre>
+    </div>
   </div>
 
   <script>
@@ -134,8 +145,14 @@
     const compareStatus = document.getElementById("compareStatus");
     const compareOutput = document.getElementById("compareOutput");
 
+    const chatPlayer = document.getElementById("chatPlayer");
+    const chatInput = document.getElementById("chatInput");
+    const chatBtn = document.getElementById("chatBtn");
+    const chatStatus = document.getElementById("chatStatus");
+    const chatOutput = document.getElementById("chatOutput");
+
     function setSelectOptions(labels) {
-      for (const select of [singlePlayer, player1, player2]) {
+      for (const select of [singlePlayer, player1, player2, chatPlayer]) {
         select.innerHTML = "";
         for (const label of labels) {
           const option = document.createElement("option");
@@ -248,6 +265,42 @@
         compareStatus.textContent = `Error: ${err.message}`;
       } finally {
         compareBtn.disabled = false;
+      }
+    });
+
+    chatBtn.addEventListener("click", async () => {
+      const player = chatPlayer.value;
+      const question = chatInput.value.trim();
+      if (!player) {
+        chatStatus.textContent = "Select a player for chat.";
+        return;
+      }
+      if (!question) {
+        chatStatus.textContent = "Type a question or request first.";
+        return;
+      }
+
+      chatBtn.disabled = true;
+      chatStatus.textContent = "Asking coach...";
+
+      try {
+        const response = await fetch("/player-chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ player, question })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Coach chat failed.");
+        }
+        let text = chatOutput.textContent || "";
+        text += `You: ${question}\nCoach: ${data.reply}\n\n`;
+        chatOutput.textContent = text;
+        chatStatus.textContent = "Coach answered.";
+      } catch (err) {
+        chatStatus.textContent = `Error: ${err.message}`;
+      } finally {
+        chatBtn.disabled = false;
       }
     });
   </script>

@@ -35,6 +35,7 @@ hf_analyzer = None
 mp_pose = None
 current_video_path = None  # Store video path for analysis
 detected_players = {}  # Store player bounding boxes: {label: [(x1,y1,x2,y2), ...frames]}
+player_analysis_context = {}  # Keep last player analytic state for chatbot follow-up
 
 
 def init_yolo():
@@ -103,6 +104,12 @@ def init_hf_analyzer():
 
 def generate_structured_feedback(prompt, max_new_tokens=260):
     """Generate cleaner, non-echoed coaching text with deterministic decoding."""
+    if hf_analyzer is None:
+        init_hf_analyzer()
+
+    if not hf_analyzer or hf_analyzer is False:
+        return "Coach chat unavailable: HF text model not initialized."
+
     tokenizer = hf_analyzer['tokenizer']
     model = hf_analyzer['model']
 
@@ -212,74 +219,105 @@ def build_rule_based_player_feedback(player, posture, balance, stance, height_ra
     drills = []
     improvements = []
 
-    if posture == "upright":
-        strengths.append("Maintains a tall torso that supports faster visual tracking and recovery.")
+    upright_ratio = pose_metrics.get("upright_ratio", 0.0)
+    centred_ratio = pose_metrics.get("centred_ratio", 0.0)
+    wide_ratio = pose_metrics.get("wide_ratio", 0.0)
+    stance_switch_rate = pose_metrics.get("stance_switch_rate", 0.0)
+    balance_switch_rate = pose_metrics.get("balance_switch_rate", 0.0)
+    vertical_mobility = pose_metrics.get("vertical_mobility", 0.0)
+    movement_consistency = box_metrics.get("movement_consistency", 0.0)
+    avg_step = box_metrics.get("avg_step_px", 0.0)
+
+    strengths.append(f"Player maintains upright posture in {upright_ratio * 100:.0f}% of frames.")
+    if centred_ratio >= 0.55:
+        strengths.append(f"Center balance preserved in {centred_ratio * 100:.0f}% of samples.")
     else:
-        weaknesses.append("Posture is too compressed, reducing reach and slowing directional change.")
+        weaknesses.append(f"Center balance only {centred_ratio * 100:.0f}% stable; focus on midline control.")
+
+    if wide_ratio >= 0.5:
+        strengths.append("Repeatable wide stance gives strong defensive stability.")
+    elif wide_ratio <= 0.25:
+        weaknesses.append("Sometimes stance is too narrow, reducing base support under pressure.")
+
+    if posture == "upright":
+        strengths.append("Tall torso and chest lift are strong for shot recovery and anticipation.")
+    else:
+        weaknesses.append("Body alignment is low; guard against early fatigue on court rallies.")
         drills.append("Shadow split-step + recovery: 4x45s, focus on chest up and neutral spine.")
 
     if balance == "centred":
-        strengths.append("Center of mass stays more controlled between shots.")
+        strengths.append("Center of mass is well controlled through movement transitions.")
     else:
-        weaknesses.append("Weight shifts off-center, causing late recovery after wide movements.")
-        drills.append("Lateral lunge hold with racket reach: 3x8 each side, 2-second stabilize on landing.")
+        weaknesses.append("Weight shift is off-centre, producing delayed court re-center.")
+        drills.append("Lateral lunge hold with racket reach: 3x8 each side, 2-second stabilize.")
 
     if stance == "wide":
-        strengths.append("Wide base provides stability on defensive contacts.")
-        weaknesses.append("Base may be too wide during recovery, reducing first-step quickness.")
-        drills.append("Split-step width drill: 5x30s, land shoulder-width then explode to corners.")
+        strengths.append("Wide base increases defensive absorbing power.")
+        weaknesses.append("Wide recovery stance may slow first-step acceleration.")
+        drills.append("Split-step width drill: 5x30s, land shoulder-width then explode to corner.")
     elif stance == "narrow":
-        weaknesses.append("Narrow base reduces stability under pressure.")
-        drills.append("Mini-band squat walk + split-step: 3x40s to build stable receiving base.")
+        weaknesses.append("Narrow base results in potential balance vulnerability.")
+        drills.append("Mini-band squat walk + split-step: 3x40s to build stable base.")
     else:
-        strengths.append("Moderate base gives a workable balance of stability and mobility.")
+        strengths.append("Moderate stance supports balanced mobility and stability.")
 
     if height_ratio >= 2.0:
-        strengths.append("Body alignment appears efficient for maintaining vertical control.")
+        strengths.append("Effective height ratio indicates efficient spine control.")
     else:
-        weaknesses.append("Low height ratio suggests excess forward fold in movement phases.")
+        weaknesses.append("Height ratio is lower than ideal; posture can be more vertical.")
         drills.append("Hip hinge wall taps + racket overhead reach: 3x10 controlled reps.")
 
+    if balance_switch_rate > 0.45:
+        weaknesses.append("Balance adjustment rate is high, suggesting jittery weight transfer.")
+        drills.append("Split-step freeze + recover: 4x30s, hold before first step.")
+    if stance_switch_rate > 0.5:
+        weaknesses.append("Stance adjustments are frequent; stabilize pre-shot setup.")
+    if vertical_mobility > 70:
+        weaknesses.append("Excess vertical motion may waste energy; keep lower center-of-gravity.")
+
+    if movement_consistency < 0.50:
+        weaknesses.append(f"Step consistency is {movement_consistency:.2f}; aim for 0.60+.")
+    if avg_step < 8:
+        weaknesses.append(f"Average step size {avg_step:.1f}px indicates limited court coverage per sample.")
+    elif avg_step > 22:
+        strengths.append(f"Larger average step ({avg_step:.1f}px) shows good court coverage aggressiveness.")
+
     if len(drills) < 3:
-        drills.append("6-point court footwork pattern: 4 rounds x 40s work / 20s rest, prioritize clean recovery.")
-    if len(drills) < 3:
-        drills.append("Two-shuttle reaction starts: 3x10 reps, commit to first step within 300 ms.")
-    drills = drills[:3]
+        drills.extend([
+            "6-point court footwork pattern: 4 rounds x 40s work / 20s rest, focus on recovery.",
+            "Two-shuttle reaction starts: 3x10 reps, commit to first step within 300ms.",
+        ])
 
     improvements.extend([
-        "Faster recovery to base should improve consistency in longer rallies.",
-        "Better balance control will reduce unforced errors during directional changes.",
-        "Cleaner posture mechanics will improve shot quality under fatigue.",
+        "Faster recovery to base should improve rally consistency.",
+        "Balanced weight transfer will reduce unforced errors on directional changes.",
+        "Cleaner posture mechanics improve endurance during longer rallies.",
+        f"Target step consistency above 0.60 (current {movement_consistency:.2f}) to raise rally control.",
     ])
 
-    if pose_metrics.get("balance_switch_rate", 0.0) > 0.45:
-        weaknesses.append("Balance pattern is inconsistent across frames (high switch rate).")
-        drills[0] = "Split-step freeze + recover: 4x30s, hold landing 1 second before first step."
-    if pose_metrics.get("stance_switch_rate", 0.0) > 0.5:
-        weaknesses.append("Base width changes too frequently, indicating inconsistent preparation.")
-    if pose_metrics.get("vertical_mobility", 0.0) > 75:
-        weaknesses.append("Excess vertical movement suggests wasted energy during transitions.")
-    if box_metrics.get("movement_consistency", 0.0) < 0.45:
-        weaknesses.append("Footwork tempo is inconsistent between steps.")
-    if box_metrics.get("avg_step_px", 0.0) < 8:
-        weaknesses.append("Average displacement per sampled frame is low, suggesting limited court coverage.")
-
     if not strengths:
-        strengths.append(f"{player} shows consistent effort and repeatable movement habits that are coachable.")
+        strengths.append("Player shows consistent work rate that can be refined for higher efficiency.")
     if not weaknesses:
-        weaknesses.append("No major technical fault dominates; focus now should be efficiency and repeatability.")
+        weaknesses.append("No major faults; sharpen details on rhythm and mental intensity.")
 
-    strengths.insert(0, f"Observed over {pose_metrics['samples']} sampled pose frames and {box_metrics['frames']} tracked boxes.")
-    improvements.append(
-        f"Targeting step consistency above 0.60 (current {box_metrics['movement_consistency']:.2f}) should improve rally control."
-    )
+    strengths.insert(0, f"Observed {pose_metrics.get('samples', 0)} pose frames and {box_metrics.get('frames', 0)} tracking samples.")
 
-    return (
-        "STRENGTHS:\n- " + "\n- ".join(strengths[:3]) + "\n\n"
-        "WEAKNESSES:\n- " + "\n- ".join(weaknesses[:4]) + "\n\n"
-        "IMPROVEMENT DRILLS:\n- " + "\n- ".join(drills) + "\n\n"
-        "EXPECTED IMPROVEMENTS:\n- " + "\n- ".join(improvements)
-    )
+    return {
+        'strengths': strengths[:5],
+        'weaknesses': weaknesses[:5],
+        'drills': drills[:4],
+        'improvements': improvements[:4],
+        'metrics': {
+            'upright_ratio': upright_ratio,
+            'centred_ratio': centred_ratio,
+            'stance_switch_rate': stance_switch_rate,
+            'balance_switch_rate': balance_switch_rate,
+            'vertical_mobility': vertical_mobility,
+            'movement_consistency': movement_consistency,
+            'avg_step_px': avg_step,
+            'height_ratio': height_ratio,
+        }
+    }
 
 
 def build_rule_based_compare_feedback(player1, p1_prof, player2, p2_prof):
@@ -446,19 +484,37 @@ def detect_humans():
         
         cap.release()
         
-        # Keep strongest tracks and map to Player1..N
+        # Keep strongest tracks and map to Player1..N with robust filtering to avoid ghost targets
+        MIN_TRACK_FRAMES = 5
+        MIN_TOTAL_MOVEMENT_PX = 22.0
+
+        shortlist = []
+        for tid, tdata in tracks.items():
+            if len(tdata["boxes"]) < MIN_TRACK_FRAMES:
+                continue
+            metrics = compute_box_metrics(tdata["boxes"])
+            if metrics["total_movement_px"] < MIN_TOTAL_MOVEMENT_PX:
+                continue
+            shortlist.append((tid, tdata, metrics))
+
+        if not shortlist:
+            shortlist = [(tid, tdata, compute_box_metrics(tdata["boxes"])) for tid, tdata in tracks.items() if len(tdata["boxes"]) >= 3]
+
         ranked_tracks = sorted(
-            [(tid, tdata) for tid, tdata in tracks.items() if len(tdata["boxes"]) >= 3],
+            shortlist,
             key=lambda item: len(item[1]["boxes"]),
             reverse=True,
         )
         detected_players = {}
-        for idx, (tid, tdata) in enumerate(ranked_tracks[:10], start=1):
+
+        for idx, (tid, tdata, metrics) in enumerate(ranked_tracks[:10], start=1):
             detected_players[f"Player{idx}"] = {
                 "track_id": tid,
                 "boxes": tdata["boxes"],
                 "poses": tdata["poses"],
+                "metrics": metrics,
             }
+
         print(f"[INFO] Detected {len(detected_players)} players with stable tracking")
         
         # Get first frame for display
@@ -541,8 +597,8 @@ def analyze_player():
         pose_metrics = summarize_pose_metrics(poses)
         box_metrics  = compute_box_metrics(boxes)
 
-        # Generate deterministic coaching text
-        feedback = build_rule_based_player_feedback(
+        # Generate deterministic coaching text (new structured version)
+        feedback_data = build_rule_based_player_feedback(
             player,
             dominant_posture,
             dominant_balance,
@@ -552,7 +608,28 @@ def analyze_player():
             box_metrics,
         )
 
-        # Final formatted output
+        # Convert structured feedback to text block for backward compatibility
+        feedback_text = (
+            "STRENGTHS:\n- " + "\n- ".join(feedback_data['strengths']) + "\n\n"
+            "WEAKNESSES:\n- " + "\n- ".join(feedback_data['weaknesses']) + "\n\n"
+            "IMPROVEMENT DRILLS:\n- " + "\n- ".join(feedback_data['drills']) + "\n\n"
+            "EXPECTED IMPROVEMENTS:\n- " + "\n- ".join(feedback_data['improvements'])
+        )
+
+        # Save context for follow-up questions
+        player_analysis_context[player] = {
+            'profile': {
+                'posture': dominant_posture,
+                'balance': dominant_balance,
+                'stance': dominant_stance,
+                'height_ratio': avg_height,
+            },
+            'pose_metrics': pose_metrics,
+            'box_metrics': box_metrics,
+            'feedback': feedback_data,
+            'summary': feedback_text,
+        }
+
         result = f"""
 COACHING ANALYSIS: {player}
 ======================================================================
@@ -564,12 +641,12 @@ TECHNICAL PROFILE:
   Height Ratio: {avg_height:.2f}
 
 FEEDBACK:
-{feedback}
+{feedback_text}
 
 ======================================================================
 """
 
-        return jsonify({'analysis': result})
+        return jsonify({'analysis': result, 'analysis_data': player_analysis_context[player]})
 
     except Exception as e:
         print(f"[ERROR] {e}")
@@ -577,6 +654,38 @@ FEEDBACK:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/player-chat', methods=['POST'])
+def player_chat():
+    global player_analysis_context
+
+    data = request.json or {}
+    player = data.get('player', '')
+    question = (data.get('question') or '').strip()
+
+    if not player:
+        return jsonify({'error': 'Player parameter is required'}), 400
+    if not question:
+        return jsonify({'error': 'Question is required to continue chat'}), 400
+    if player not in player_analysis_context:
+        return jsonify({'error': 'No analysis context for player, run player analysis first'}), 400
+
+    context = player_analysis_context[player]
+    prompt = (
+        f"You are a badminton coach chatbot. A coach has already generated the following analysis for {player}:\n"
+        f"Technical profile: posture={context['profile']['posture']}, balance={context['profile']['balance']}, "
+        f"stance={context['profile']['stance']}, height_ratio={context['profile']['height_ratio']:.2f}.\n"
+        f"Pose and box metrics: upright_ratio={context['pose_metrics'].get('upright_ratio',0):.2f}, "
+        f"centred_ratio={context['pose_metrics'].get('centred_ratio',0):.2f}, "
+        f"movement_consistency={context['box_metrics'].get('movement_consistency',0):.2f}, "
+        f"avg_step_px={context['box_metrics'].get('avg_step_px',0):.1f}.\n"
+        f"Feedback summary:\n{context['feedback']['strengths']}\n{context['feedback']['weaknesses']}\n"
+        f"User question: {question}\n"
+        "Answer clearly with actionable coaching and encourage follow-up questions."
+    )
+
+    reply = generate_structured_feedback(prompt, max_new_tokens=200)
+    return jsonify({'player': player, 'question': question, 'reply': reply})
 
 
 @app.route('/compare-players', methods=['POST'])
