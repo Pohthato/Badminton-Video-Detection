@@ -1,0 +1,283 @@
+{% extends "base.html" %}
+{% block title %}Coach Chat | Badminton Analyzer{% endblock %}
+
+{% block content %}
+  <div class="card">
+    <div class="hero-tag">Step 3: Live Coaching</div>
+    <h1>Ask Your Coach</h1>
+    <p class="lead">Ask follow-up questions about your player's performance or compare two players side by side.</p>
+
+    {% if not players %}
+      <div class="alert">No players detected yet. Start by uploading a video on the Upload page.</div>
+      <div class="form-row" style="margin-top: 20px;">
+        <a href="/" class="button">Go back to Upload</a>
+      </div>
+    {% else %}
+      <div class="panel" style="margin-bottom: 24px;">
+        <h2>Player Analysis Chat</h2>
+        <div class="form-row inline">
+          <select id="chatPlayer">
+            {% for player in players %}
+              <option value="{{ player }}">{{ player }}</option>
+            {% endfor %}
+          </select>
+          <input id="chatInput" type="text" placeholder="Ask the coach anything about this player...">
+          <button id="chatBtn" class="btn-primary">Ask</button>
+        </div>
+      </div>
+
+      <div id="chatContainer" class="chat-window">
+        <div class="chat-message coach">
+          <div class="message-bubble">
+            <p>Hi! Ask me any questions about the player's technique, posture, or performance. I'm here to help!</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top: 28px;">
+        <h2>Compare Two Players</h2>
+        <div class="form-row inline">
+          <select id="player1">
+            {% for player in players %}
+              <option value="{{ player }}">{{ player }}</option>
+            {% endfor %}
+          </select>
+          <select id="player2">
+            {% for player in players %}
+              <option value="{{ player }}">{{ player }}</option>
+            {% endfor %}
+          </select>
+          <button id="compareBtn" class="btn-primary">Compare</button>
+        </div>
+        <div id="compareStatus" class="status"></div>
+        <div id="compareOutput" class="result-box">Select two different players to see a detailed comparison.</div>
+      </div>
+    {% endif %}
+  </div>
+
+  <style>
+    .chat-window {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      height: 500px;
+      overflow-y: auto;
+      padding: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chat-message {
+      display: flex;
+      margin-bottom: 12px;
+      animation: slideIn 0.3s ease-out;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .chat-message.user {
+      justify-content: flex-end;
+    }
+
+    .chat-message.coach {
+      justify-content: flex-start;
+    }
+
+    .message-bubble {
+      max-width: 70%;
+      padding: 12px 16px;
+      border-radius: 12px;
+      line-height: 1.5;
+      word-wrap: break-word;
+      font-size: 14px;
+    }
+
+    .chat-message.user .message-bubble {
+      background: #0f766e;
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+
+    .chat-message.coach .message-bubble {
+      background: #f3f4f6;
+      color: #1f2937;
+      border-bottom-left-radius: 4px;
+      border: 1px solid #e5e7eb;
+    }
+
+    .chat-window::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .chat-window::-webkit-scrollbar-track {
+      background: #f1f5f9;
+      border-radius: 10px;
+    }
+
+    .chat-window::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 10px;
+    }
+
+    .chat-window::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+
+    .btn-primary {
+      background: #0f766e;
+      color: #fff;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      transition: background 0.2s;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: #0d5f56;
+    }
+
+    .btn-primary:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+    }
+
+    .inline input[type="text"] {
+      flex: 1;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 14px;
+    }
+  </style>
+
+  <script>
+    const chatPlayer = document.getElementById('chatPlayer');
+    const chatInput = document.getElementById('chatInput');
+    const chatBtn = document.getElementById('chatBtn');
+    const chatContainer = document.getElementById('chatContainer');
+    const compareBtn = document.getElementById('compareBtn');
+    const player1 = document.getElementById('player1');
+    const player2 = document.getElementById('player2');
+    const compareStatus = document.getElementById('compareStatus');
+    const compareOutput = document.getElementById('compareOutput');
+
+    function addMessage(text, isUser = false, isLoading = false) {
+      const messageDiv = document.createElement('div');
+      messageDiv.className = `chat-message ${isUser ? 'user' : 'coach'}`;
+      const bubble = document.createElement('div');
+      bubble.className = 'message-bubble';
+      
+      if (isLoading) {
+        bubble.innerHTML = '<div class="loading-indicator message"><span class="spinner"></span><span>Coach is thinking...</span></div>';
+      } else {
+        bubble.textContent = text;
+      }
+      
+      messageDiv.appendChild(bubble);
+      chatContainer.appendChild(messageDiv);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+      return messageDiv;
+    }
+
+    chatBtn.addEventListener('click', async () => {
+      const player = chatPlayer.value;
+      const question = chatInput.value.trim();
+      
+      if (!player) {
+        addMessage('Please select a player first.', false);
+        return;
+      }
+      
+      if (!question) {
+        addMessage('Please type a question.', false);
+        return;
+      }
+
+      addMessage(question, true);
+      chatInput.value = '';
+      chatBtn.disabled = true;
+
+      const loadingMsg = addMessage('', false, true);
+
+      try {
+        const response = await fetch('/player-chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ player, question })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok || !data.success) {
+          throw new Error(data.error || 'Coach request failed.');
+        }
+        
+        loadingMsg.remove();
+        addMessage(data.reply, false);
+      } catch (err) {
+        loadingMsg.remove();
+        addMessage(`✗ Error: ${err.message}`, false);
+      } finally {
+        chatBtn.disabled = false;
+      }
+    });
+
+    chatInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter' && !chatBtn.disabled) {
+        chatBtn.click();
+      }
+    });
+
+    compareBtn.addEventListener('click', async () => {
+      const a = player1.value;
+      const b = player2.value;
+      
+      if (!a || !b) {
+        compareStatus.textContent = 'Select two players to compare.';
+        return;
+      }
+      
+      if (a === b) {
+        compareStatus.textContent = 'Choose two different players.';
+        return;
+      }
+
+      compareBtn.disabled = true;
+      compareStatus.innerHTML = '<div class="loading-indicator"><span class="spinner"></span>Comparing players...</div>';
+      compareOutput.textContent = '';
+
+      try {
+        const response = await fetch('/compare-players', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ player1: a, player2: b })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || 'Comparison failed.');
+        }
+        
+        compareOutput.textContent = data.analysis || 'No comparison returned.';
+        compareStatus.textContent = '✓ Comparison complete.';
+      } catch (err) {
+        compareStatus.textContent = `✗ Error: ${err.message}`;
+      } finally {
+        compareBtn.disabled = false;
+      }
+    });
+  </script>
+{% endblock %}

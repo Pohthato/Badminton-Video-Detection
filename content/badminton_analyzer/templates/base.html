@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Badminton Analyzer{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">🏸</div>
+      <div>
+        <span>Badminton</span>
+        <strong>Analyzer</strong>
+      </div>
+    </div>
+    <nav class="breadcrumb">
+      <a href="/" class="{% if request.path == '/' %}active{% endif %}">Upload</a>
+      <a href="/analysis" class="{% if request.path == '/analysis' %}active{% endif %}">Analyze</a>
+      <a href="/coach" class="{% if request.path == '/coach' %}active{% endif %}">Coach</a>
+    </nav>
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">Built for fast badminton coaching and video analytics.</footer>
+</body>
+</html>

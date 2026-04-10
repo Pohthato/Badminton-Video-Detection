@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Analyze Players | Badminton Analyzer{% endblock %}
+{% block content %}
+  <div class="card">
+    <div class="hero-tag">Step 2: Analyze detected players</div>
+    <h1>Player Analysis</h1>
+    <p class="lead">Select a detected player from the match and generate a detailed coaching report with posture, balance, and movement insights.</p>
+
+    {% if not players %}
+      <div class="alert">No detections available yet. Upload a video first on the Upload page to analyze players.</div>
+      <div class="form-row" style="margin-top:20px;">
+        <a href="/" class="button">Go back to Upload</a>
+      </div>
+    {% else %}
+      <div class="form-row inline">
+        <select id="playerSelect">
+          {% for player in players %}
+            <option value="{{ player }}">{{ player }}</option>
+          {% endfor %}
+        </select>
+        <button id="analyzeBtn">Analyze Selected Player</button>
+      </div>
+      <div id="analyzeStatus" class="status">Detected players: {{ players|length }}. Select one and analyze.</div>
+    {% endif %}
+  </div>
+
+  {% if players %}
+    <div class="card preview-card">
+      <h2>Detected Frame</h2>
+      {% if preview %}
+        <img src="data:image/jpeg;base64,{{ preview }}" alt="Detected video frame">
+      {% else %}
+        <div class="alert">No preview is available yet. Run detection again if needed.</div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Analysis Output</h2>
+      <div id="analysisOutput" class="output-box">Select a player and click Analyze to generate the report.</div>
+      <div id="commentaryBox" class="panel" style="display:none;">
+        <h3>AI Coach Commentary</h3>
+        <div id="commentaryText" class="result-box"></div>
+      </div>
+      <div class="form-row" style="margin-top:22px;">
+        <button id="continueBtn" type="button" disabled>Continue to Coach</button>
+      </div>
+    </div>
+  {% endif %}
+
+  <script>
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const playerSelect = document.getElementById('playerSelect');
+    const analyzeStatus = document.getElementById('analyzeStatus');
+    const analysisOutput = document.getElementById('analysisOutput');
+    const commentaryBox = document.getElementById('commentaryBox');
+    const commentaryText = document.getElementById('commentaryText');
+    const continueBtn = document.getElementById('continueBtn');
+
+    if (analyzeBtn) {
+      analyzeBtn.addEventListener('click', async () => {
+        const player = playerSelect.value;
+        analyzeBtn.disabled = true;
+        analyzeStatus.textContent = 'Analyzing player metrics...';
+        commentaryBox.style.display = 'none';
+        commentaryText.textContent = '';
+
+        try {
+          const response = await fetch('/analyze-player', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ player })
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || 'Analysis failed.');
+          }
+
+          analysisOutput.textContent = data.analysis || 'No analysis returned.';
+          if (data.ai_commentary) {
+            commentaryText.textContent = data.ai_commentary;
+            commentaryBox.style.display = 'block';
+          }
+          analyzeStatus.textContent = 'Analysis complete. You can continue to the coach module.';
+          continueBtn.disabled = false;
+        } catch (err) {
+          analyzeStatus.textContent = `Error: ${err.message}`;
+          analysisOutput.textContent = '';
+        } finally {
+          analyzeBtn.disabled = false;
+        }
+      });
+    }
+
+    if (continueBtn) {
+      continueBtn.addEventListener('click', () => {
+        window.location.href = '/coach';
+      });
+    }
+  </script>
+{% endblock %}

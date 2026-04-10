@@ -9,6 +9,12 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from flask_cors import CORS
+
+# Suppress HF token warning
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+import warnings
+warnings.filterwarnings('ignore')
 
 # MediaPipe imports
 try:
@@ -20,6 +26,15 @@ except ImportError as e:
     mp = None
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
+CORS(app)
+
+# Ensure all errors return JSON, not HTML
+@app.errorhandler(Exception)
+def handle_error(error):
+    print(f"[ERROR] Unhandled exception: {error}")
+    import traceback
+    traceback.print_exc()
+    return jsonify({'success': False, 'error': str(error)}), 500
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / 'uploads'
@@ -36,6 +51,7 @@ mp_pose = None
 current_video_path = None  # Store video path for analysis
 detected_players = {}  # Store player bounding boxes: {label: [(x1,y1,x2,y2), ...frames]}
 player_analysis_context = {}  # Keep last player analytic state for chatbot follow-up
+last_detected_frame = None  # Base64 preview image from the latest detection
 
 
 def init_yolo():
@@ -49,6 +65,7 @@ def init_yolo():
         except Exception as e:
             print(f"[ERROR] Failed to load YOLO: {e}")
             yolo_model = False  # Mark as failed attempt
+
 
 
 def init_mediapipe():
@@ -90,40 +107,50 @@ def init_hf_analyzer():
     global hf_analyzer
     if hf_analyzer is None:
         try:
-            print("[INFO] Loading HF analyzer (FLAN-T5-large)...")
-            tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-large')
-            model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-large').to('cpu')
+            print("[INFO] Loading HF analyzer (FLAN-T5-base - smaller model)...")
+            # Use smaller model with simple CPU placement
+            tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-base')
+            model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-base')
+            model.cpu()  # Move to CPU without device_map
             hf_analyzer = {'tokenizer': tokenizer, 'model': model}
             print("[INFO] HF analyzer loaded successfully (CPU)")
         except Exception as e:
-            print(f"[ERROR] Failed to load HF analyzer: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[WARNING] HF analyzer not available, using rule-based feedback: {e}")
             hf_analyzer = False
 
 
 def generate_structured_feedback(prompt, max_new_tokens=260):
     """Generate cleaner, non-echoed coaching text with deterministic decoding."""
-    if hf_analyzer is None:
-        init_hf_analyzer()
+    try:
+        if hf_analyzer is None:
+            init_hf_analyzer()
 
-    if not hf_analyzer or hf_analyzer is False:
-        return "Coach chat unavailable: HF text model not initialized."
+        if not hf_analyzer or hf_analyzer is False:
+            return "Coach chat unavailable: HF text model not initialized."
 
-    tokenizer = hf_analyzer['tokenizer']
-    model = hf_analyzer['model']
+        tokenizer = hf_analyzer['tokenizer']
+        model = hf_analyzer['model']
 
-    inputs = tokenizer(prompt, return_tensors='pt', max_length=512, truncation=True)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        num_beams=4,
-        early_stopping=True,
-        no_repeat_ngram_size=3,
-        repetition_penalty=1.2
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        inputs = tokenizer(prompt, return_tensors='pt', max_length=512, truncation=True)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,  # Enable sampling for more varied and longer responses
+            temperature=0.7,  # Add creativity
+            top_p=0.9,  # Nucleus sampling
+            num_beams=1,  # Disable beams when sampling
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.pad_token_id
+        )
+        result = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        return result if result else "I apologize, but I couldn't generate a response at this time."
+
+    except Exception as e:
+        print(f"[ERROR] in generate_structured_feedback: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"Error generating coaching feedback: {str(e)}"
 
 
 def summarize_pose_metrics(poses):
@@ -378,9 +405,82 @@ def assign_detections_to_tracks(track_state, detections, max_distance=140.0):
     return assignments
 
 
+# Preload HF analyzer at startup
+init_hf_analyzer()
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/analysis")
+def analysis_page():
+    players = list(detected_players.keys())
+    return render_template(
+        "analysis.html",
+        players=players,
+        preview=last_detected_frame,
+        has_analysis=bool(player_analysis_context),
+    )
+
+
+@app.route("/coach")
+def coach_page():
+    players = list(detected_players.keys())
+    analyzed_players = list(player_analysis_context.keys())
+    return render_template(
+        "chat.html",
+        players=players,
+        analyzed_players=analyzed_players,
+    )
+
+
+def apply_nms(boxes, overlap_threshold=0.3):
+    """Remove overlapping boxes using Non-Maximum Suppression."""
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    keep = []
+    for i, (x1, y1, x2, y2) in enumerate(boxes):
+        if not keep:
+            keep.append((x1, y1, x2, y2))
+            continue
+        is_duplicate = False
+        for kx1, ky1, kx2, ky2 in keep:
+            inter_x1 = max(x1, kx1)
+            inter_y1 = max(y1, ky1)
+            inter_x2 = min(x2, kx2)
+            inter_y2 = min(y2, ky2)
+            if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                box_area = (x2 - x1) * (y2 - y1)
+                iou = inter_area / (box_area + 1e-6)
+                if iou > overlap_threshold:
+                    is_duplicate = True
+                    break
+        if not is_duplicate:
+            keep.append((x1, y1, x2, y2))
+    return keep
+
+
+def filter_close_detections(boxes, min_distance_px=40):
+    """Remove detections that are too close to each other (ghost boxes)."""
+    if len(boxes) <= 1:
+        return boxes
+    filtered = []
+    for x1, y1, x2, y2 in sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True):
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        is_close = False
+        for fx1, fy1, fx2, fy2 in filtered:
+            fcx, fcy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+            dist = np.sqrt((cx - fcx) ** 2 + (cy - fcy) ** 2)
+            if dist < min_distance_px:
+                is_close = True
+                break
+        if not is_close:
+            filtered.append((x1, y1, x2, y2))
+    return filtered
 
 
 def allowed_file(filename):
@@ -393,7 +493,7 @@ def detect_humans():
     Upload video, detect humans with YOLO across multiple frames,
     extract pose data with MediaPipe, and save for analysis.
     """
-    global current_video_path, detected_players
+    global current_video_path, detected_players, last_detected_frame
     
     if 'video' not in request.files:
         return jsonify({'error': 'No video file part'}), 400
@@ -428,7 +528,7 @@ def detect_humans():
         
         print("[INFO] Analyzing video for player pose data...")
         
-        while frame_count < 150:  # First 150 frames (~5 sec at 30fps)
+        while frame_count < 300:  # Increased from 150 to 300 frames (~10 sec at 30fps)
             ret, frame = cap.read()
             if not ret:
                 break
@@ -440,17 +540,37 @@ def detect_humans():
                     scale = 1280 / w
                     frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
                 
-                # YOLO detection
+                # YOLO detection with stricter filtering
                 results = yolo_model(frame, conf=0.5)
                 detections = []
                 for box in results[0].boxes:
                     cls = int(box.cls[0])
-                    if cls == 0:  # Person class
+                    conf = float(box.conf[0]) if box.conf is not None else 0.0
+                    if cls == 0 and conf >= 0.45:  # Stricter: Person class with higher confidence
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        box_width = x2 - x1
+                        box_height = y2 - y1
+                        area = box_width * box_height
+                        # Strict dimension filtering
+                        if box_width < 90 or box_height < 150:  # Tighter minimum
+                            continue
+                        if box_width > 400 or box_height > 500:  # Maximum to reject groups
+                            continue
+                        # Strict aspect ratio: humans are taller than wide
+                        aspect_ratio = box_height / (box_width + 1e-6)
+                        if aspect_ratio < 1.3 or aspect_ratio > 3.0:
+                            continue
+                        # Area constraints
+                        if area < 24000 or area > 150000:  # Tighter bounds
+                            continue
                         detections.append((x1, y1, x2, y2))
 
-                if len(detections) > 10:
-                    detections = detections[:10]
+                # Apply NMS and spatial filtering to remove ghosts
+                detections = apply_nms(detections, overlap_threshold=0.2)
+                detections = filter_close_detections(detections, min_distance_px=50)
+
+                if len(detections) > 6:
+                    detections = detections[:6]
 
                 assignments = assign_detections_to_tracks(active_track_boxes, detections)
                 new_active = {}
@@ -485,8 +605,10 @@ def detect_humans():
         cap.release()
         
         # Keep strongest tracks and map to Player1..N with robust filtering to avoid ghost targets
-        MIN_TRACK_FRAMES = 5
-        MIN_TOTAL_MOVEMENT_PX = 22.0
+        MIN_TRACK_FRAMES = 15  # Stricter: must see movement across more frames
+        MIN_TOTAL_MOVEMENT_PX = 100.0  # Stricter: must move significantly
+        MIN_AVG_AREA_PX2 = 25000.0  # Tighter
+        MAX_AVG_AREA_PX2 = 140000.0  # Tighter upper bound
 
         shortlist = []
         for tid, tdata in tracks.items():
@@ -495,19 +617,34 @@ def detect_humans():
             metrics = compute_box_metrics(tdata["boxes"])
             if metrics["total_movement_px"] < MIN_TOTAL_MOVEMENT_PX:
                 continue
-            shortlist.append((tid, tdata, metrics))
+            avg_width = np.mean([b[2] - b[0] for b in tdata["boxes"]]) if tdata["boxes"] else 0
+            avg_height = np.mean([b[3] - b[1] for b in tdata["boxes"]]) if tdata["boxes"] else 0
+            if avg_width < 80 or avg_height < 120:
+                continue
+            if not (MIN_AVG_AREA_PX2 <= metrics["avg_area_px2"] <= MAX_AVG_AREA_PX2):
+                continue
+            score = (
+                metrics["total_movement_px"] * 0.5
+                + metrics["avg_area_px2"] * 0.001
+                + avg_width * 0.5
+            )
+            shortlist.append((tid, tdata, metrics, score))
 
         if not shortlist:
-            shortlist = [(tid, tdata, compute_box_metrics(tdata["boxes"])) for tid, tdata in tracks.items() if len(tdata["boxes"]) >= 3]
+            shortlist = [
+                (tid, tdata, compute_box_metrics(tdata["boxes"]), 0)
+                for tid, tdata in tracks.items()
+                if len(tdata["boxes"]) >= 8
+            ]
 
         ranked_tracks = sorted(
             shortlist,
-            key=lambda item: len(item[1]["boxes"]),
+            key=lambda item: (item[3], len(item[1]["boxes"]), item[2]["avg_area_px2"]),
             reverse=True,
         )
         detected_players = {}
 
-        for idx, (tid, tdata, metrics) in enumerate(ranked_tracks[:10], start=1):
+        for idx, (tid, tdata, metrics, _) in enumerate(ranked_tracks[:3], start=1):
             detected_players[f"Player{idx}"] = {
                 "track_id": tid,
                 "boxes": tdata["boxes"],
@@ -544,6 +681,8 @@ def detect_humans():
         else:
             frame_b64 = None
             labels = []
+
+        last_detected_frame = frame_b64
         
         return jsonify({
             'frame': frame_b64,
@@ -597,24 +736,61 @@ def analyze_player():
         pose_metrics = summarize_pose_metrics(poses)
         box_metrics  = compute_box_metrics(boxes)
 
-        # Generate deterministic coaching text (new structured version)
-        feedback_data = build_rule_based_player_feedback(
-            player,
-            dominant_posture,
-            dominant_balance,
-            dominant_stance,
-            avg_height,
-            pose_metrics,
-            box_metrics,
-        )
+        # Check for sufficient movement - if player is mostly stationary, provide limited feedback
+        total_movement = box_metrics.get('total_movement_px', 0)
+        avg_step = box_metrics.get('avg_step_px', 0)
+        if total_movement < 50 or avg_step < 5:
+            # Player appears stationary - provide basic feedback only
+            feedback_text = (
+                "STRENGTHS:\n- Player detected and tracked successfully.\n\n"
+                "WEAKNESSES:\n- Limited movement detected in this sample.\n\n"
+                "IMPROVEMENT DRILLS:\n- Focus on dynamic movement patterns in future analysis.\n\n"
+                "EXPECTED IMPROVEMENTS:\n- Upload video with active gameplay for more detailed feedback."
+            )
+            ai_commentary = "This analysis shows limited movement. For better coaching insights, please upload video of active badminton play with court movement."
+        else:
+            # Generate full feedback for active players
+            feedback_data = build_rule_based_player_feedback(
+                player,
+                dominant_posture,
+                dominant_balance,
+                dominant_stance,
+                avg_height,
+                pose_metrics,
+                box_metrics,
+            )
 
-        # Convert structured feedback to text block for backward compatibility
-        feedback_text = (
-            "STRENGTHS:\n- " + "\n- ".join(feedback_data['strengths']) + "\n\n"
-            "WEAKNESSES:\n- " + "\n- ".join(feedback_data['weaknesses']) + "\n\n"
-            "IMPROVEMENT DRILLS:\n- " + "\n- ".join(feedback_data['drills']) + "\n\n"
-            "EXPECTED IMPROVEMENTS:\n- " + "\n- ".join(feedback_data['improvements'])
-        )
+            feedback_text = (
+                "STRENGTHS:\n- " + "\n- ".join(feedback_data['strengths']) + "\n\n"
+                "WEAKNESSES:\n- " + "\n- ".join(feedback_data['weaknesses']) + "\n\n"
+                "IMPROVEMENT DRILLS:\n- " + "\n- ".join(feedback_data['drills']) + "\n\n"
+                "EXPECTED IMPROVEMENTS:\n- " + "\n- ".join(feedback_data['improvements'])
+            )
+
+            # Generate AI commentary
+            init_hf_analyzer()
+            ai_commentary = ""
+            if hf_analyzer and hf_analyzer is not False:
+                commentary_prompt = (
+                    "You are an expert badminton coach. "
+                    f"Analyze {player}'s performance and write a direct coaching commentary based on this profile:\n"
+                    f"- Posture: {dominant_posture}\n"
+                    f"- Balance: {dominant_balance}\n"
+                    f"- Stance: {dominant_stance}\n"
+                    f"- Upright ratio: {pose_metrics.get('upright_ratio', 0):.0%}\n"
+                    f"- Centered ratio: {pose_metrics.get('centred_ratio', 0):.0%}\n"
+                    f"- Step consistency: {box_metrics.get('movement_consistency', 0):.2f}\n"
+                    f"- Average step: {box_metrics.get('avg_step_px', 0):.1f}px\n"
+                    "Answer in 4-6 complete sentences with specific advice, corrective drills, and encouragement. "
+                    "Do not repeat the prompt or the instruction text."
+                )
+                ai_commentary = generate_structured_feedback(commentary_prompt, max_new_tokens=600)
+                if ai_commentary.strip().startswith("You are") or ai_commentary.strip().startswith("As a professional badminton coach"):
+                    fallback_prompt = (
+                        "Rewrite the following coaching message as a direct badminton coaching paragraph without restating the instruction or the prompt:\n"
+                        f"{ai_commentary}"
+                    )
+                    ai_commentary = generate_structured_feedback(fallback_prompt, max_new_tokens=250)
 
         # Save context for follow-up questions
         player_analysis_context[player] = {
@@ -628,6 +804,7 @@ def analyze_player():
             'box_metrics': box_metrics,
             'feedback': feedback_data,
             'summary': feedback_text,
+            'ai_commentary': ai_commentary,
         }
 
         result = f"""
@@ -644,9 +821,16 @@ FEEDBACK:
 {feedback_text}
 
 ======================================================================
+AI COACH COMMENTARY:
+{ai_commentary}
+======================================================================
 """
 
-        return jsonify({'analysis': result, 'analysis_data': player_analysis_context[player]})
+        return jsonify({
+            'analysis': result,
+            'analysis_data': player_analysis_context[player],
+            'ai_commentary': ai_commentary,
+        })
 
     except Exception as e:
         print(f"[ERROR] {e}")
@@ -655,37 +839,90 @@ FEEDBACK:
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/debug-context', methods=['GET'])
+def debug_context():
+    global player_analysis_context, detected_players
+    return jsonify({
+        'detected_players': list(detected_players.keys()),
+        'player_analysis_context': list(player_analysis_context.keys()),
+        'context_details': {k: list(v.keys()) for k, v in player_analysis_context.items()}
+    })
+
+
 @app.route('/player-chat', methods=['POST'])
 def player_chat():
+    print(f"\n[LOG] ========== /player-chat START ==========")
     global player_analysis_context
+    
+    try:
+        print(f"[LOG] 1. Request received")
+        
+        # Parse JSON request
+        try:
+            data = request.get_json(force=True)
+            print(f"[LOG] 2. JSON parsed: {data}")
+        except Exception as je:
+            print(f"[ERROR] 2. JSON parse error: {je}")
+            return jsonify({'success': False, 'error': f'Invalid JSON: {str(je)}'}), 400
+        
+        player = data.get('player', '').strip()
+        question = data.get('question', '').strip()
+        print(f"[LOG] 3. Extracted: player='{player}', question='{question}'")
 
-    data = request.json or {}
-    player = data.get('player', '')
-    question = (data.get('question') or '').strip()
+        if not player:
+            print(f"[LOG] 4. No player provided")
+            return jsonify({'success': False, 'error': 'Player required'}), 400
+        if not question:
+            print(f"[LOG] 4. No question provided")
+            return jsonify({'success': False, 'error': 'Question required'}), 400
+        if player not in player_analysis_context:
+            print(f"[LOG] 4. Player '{player}' not in context. Available: {list(player_analysis_context.keys())}")
+            return jsonify({'success': False, 'error': 'Run analysis first'}), 400
 
-    if not player:
-        return jsonify({'error': 'Player parameter is required'}), 400
-    if not question:
-        return jsonify({'error': 'Question is required to continue chat'}), 400
-    if player not in player_analysis_context:
-        return jsonify({'error': 'No analysis context for player, run player analysis first'}), 400
-
-    context = player_analysis_context[player]
-    prompt = (
-        f"You are a badminton coach chatbot. A coach has already generated the following analysis for {player}:\n"
-        f"Technical profile: posture={context['profile']['posture']}, balance={context['profile']['balance']}, "
-        f"stance={context['profile']['stance']}, height_ratio={context['profile']['height_ratio']:.2f}.\n"
-        f"Pose and box metrics: upright_ratio={context['pose_metrics'].get('upright_ratio',0):.2f}, "
-        f"centred_ratio={context['pose_metrics'].get('centred_ratio',0):.2f}, "
-        f"movement_consistency={context['box_metrics'].get('movement_consistency',0):.2f}, "
-        f"avg_step_px={context['box_metrics'].get('avg_step_px',0):.1f}.\n"
-        f"Feedback summary:\n{context['feedback']['strengths']}\n{context['feedback']['weaknesses']}\n"
-        f"User question: {question}\n"
-        "Answer clearly with actionable coaching and encourage follow-up questions."
-    )
-
-    reply = generate_structured_feedback(prompt, max_new_tokens=200)
-    return jsonify({'player': player, 'question': question, 'reply': reply})
+        print(f"[LOG] 4. All validation passed")
+        ctx = player_analysis_context[player]
+        profile = ctx.get('profile', {})
+        print(f"[LOG] 5. Profile extracted: {profile}")
+        
+        # Simple, direct prompt for the chatbot
+        prompt = (
+            "You are an expert badminton coach. "
+            f"Player profile: posture={profile.get('posture', 'unknown')}, "
+            f"balance={profile.get('balance', 'unknown')}, stance={profile.get('stance', 'unknown')}. "
+            f"Upright ratio={ctx.get('pose_metrics', {}).get('upright_ratio', 0):.0%}, "
+            f"centered balance={ctx.get('pose_metrics', {}).get('centred_ratio', 0):.0%}, "
+            f"step consistency={ctx.get('box_metrics', {}).get('movement_consistency', 0):.2f}. "
+            f"The user asks: {question}\n\n"
+            "Reply in 4-6 complete sentences with specific drills, corrections, and encouragement. "
+            "Do not repeat the question or the prompt text."
+        )
+        print(f"[LOG] 6. Prompt prepared, calling generate_structured_feedback...")
+        
+        try:
+            reply = generate_structured_feedback(prompt, max_new_tokens=500)
+            print(f"[LOG] 7. Model responded: {reply[:80]}")
+        except Exception as model_err:
+            print(f"[ERROR] 7. Model generation failed: {type(model_err).__name__}: {model_err}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({'success': False, 'error': f'Model error: {str(model_err)}'}), 500
+        
+        print(f"[LOG] 8. Returning response")
+        result = jsonify({
+            'success': True,
+            'player': player,
+            'question': question,
+            'reply': reply
+        })
+        print(f"[LOG] ========== /player-chat END ==========\n")
+        return result, 200
+    
+    except Exception as e:
+        print(f"[ERROR] OUTER EXCEPTION: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"[LOG] ========== /player-chat END (WITH ERROR) ==========\n")
+        return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
 
 
 @app.route('/compare-players', methods=['POST'])
@@ -754,6 +991,10 @@ COMPARATIVE ANALYSIS: {player1} vs {player2}
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+print("[INFO] Flask routes after registration:")
+for rule in app.url_map.iter_rules():
+    print(f"  {rule}")
 
 if __name__ == "__main__":
     app.run(debug=True, host="127.0.0.1", port=5000)
