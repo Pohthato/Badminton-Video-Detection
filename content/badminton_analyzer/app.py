@@ -107,13 +107,13 @@ def init_hf_analyzer():
     global hf_analyzer
     if hf_analyzer is None:
         try:
-            print("[INFO] Loading HF analyzer (FLAN-T5-base - smaller model)...")
-            # Use smaller model with simple CPU placement
-            tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-base')
-            model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-base')
+            print("[INFO] Loading HF analyzer (FLAN-T5-small - fast & efficient)...")
+            # Use smaller, faster model optimized for speed
+            tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-small')
+            model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-small')
             model.cpu()  # Move to CPU without device_map
             hf_analyzer = {'tokenizer': tokenizer, 'model': model}
-            print("[INFO] HF analyzer loaded successfully (CPU)")
+            print("[INFO] HF analyzer loaded successfully (CPU) - ~3x faster than base model")
         except Exception as e:
             print(f"[WARNING] HF analyzer not available, using rule-based feedback: {e}")
             hf_analyzer = False
