@@ -59,6 +59,26 @@ detected_players = {}  # Store player bounding boxes: {label: [(x1,y1,x2,y2), ..
 player_analysis_context = {}  # Keep last player analytic state for chatbot follow-up
 last_detected_frame = None  # Base64 preview image from the latest detection
 
+COCO_KEYPOINTS = {
+    'nose': 0,
+    'left_eye': 1,
+    'right_eye': 2,
+    'left_ear': 3,
+    'right_ear': 4,
+    'left_shoulder': 5,
+    'right_shoulder': 6,
+    'left_elbow': 7,
+    'right_elbow': 8,
+    'left_wrist': 9,
+    'right_wrist': 10,
+    'left_hip': 11,
+    'right_hip': 12,
+    'left_knee': 13,
+    'right_knee': 14,
+    'left_ankle': 15,
+    'right_ankle': 16,
+}
+
 
 def init_yolo():
     global yolo_model
@@ -102,6 +122,25 @@ def box_iou(boxA, boxB):
     if boxAArea + boxBArea - interArea == 0:
         return 0.0
     return interArea / (boxAArea + boxBArea - interArea)
+
+
+def safe_angle(point_a, point_b, point_c):
+    """Return the angle ABC in degrees, or None when geometry is unreliable."""
+    a = np.array(point_a, dtype=float)
+    b = np.array(point_b, dtype=float)
+    c = np.array(point_c, dtype=float)
+    ba = a - b
+    bc = c - b
+    ba_norm = np.linalg.norm(ba)
+    bc_norm = np.linalg.norm(bc)
+    if ba_norm < 1e-6 or bc_norm < 1e-6:
+        return None
+    cosine = np.clip(np.dot(ba, bc) / (ba_norm * bc_norm), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def score_is_reliable(scores, indices, threshold=0.35):
+    return all(float(scores[idx]) >= threshold for idx in indices)
 
 
 SKELETON_EDGES = [
@@ -189,12 +228,15 @@ def compute_pose_features_from_keypoints(keypoints, box, frame_shape):
     key_xy = keypoints[:, :2]
     key_conf = keypoints[:, 2]
 
-    left_shoulder = key_xy[5]
-    right_shoulder = key_xy[6]
-    left_hip = key_xy[11]
-    right_hip = key_xy[12]
-    left_ankle = key_xy[15]
-    right_ankle = key_xy[16]
+    left_shoulder = key_xy[COCO_KEYPOINTS['left_shoulder']]
+    right_shoulder = key_xy[COCO_KEYPOINTS['right_shoulder']]
+    left_hip = key_xy[COCO_KEYPOINTS['left_hip']]
+    right_hip = key_xy[COCO_KEYPOINTS['right_hip']]
+    left_knee = key_xy[COCO_KEYPOINTS['left_knee']]
+    right_knee = key_xy[COCO_KEYPOINTS['right_knee']]
+    left_ankle = key_xy[COCO_KEYPOINTS['left_ankle']]
+    right_ankle = key_xy[COCO_KEYPOINTS['right_ankle']]
+    nose = key_xy[COCO_KEYPOINTS['nose']]
 
     shoulder_center = (left_shoulder + right_shoulder) / 2.0
     hip_center = (left_hip + right_hip) / 2.0
@@ -217,13 +259,41 @@ def compute_pose_features_from_keypoints(keypoints, box, frame_shape):
     else:
         stance = 'moderate'
 
+    shoulder_tilt_deg = abs(float(np.degrees(np.arctan2(right_shoulder[1] - left_shoulder[1], right_shoulder[0] - left_shoulder[0]))))
+    hip_tilt_deg = abs(float(np.degrees(np.arctan2(right_hip[1] - left_hip[1], right_hip[0] - left_hip[0]))))
+
+    left_knee_angle = safe_angle(left_hip, left_knee, left_ankle) if score_is_reliable(key_conf, [COCO_KEYPOINTS['left_hip'], COCO_KEYPOINTS['left_knee'], COCO_KEYPOINTS['left_ankle']]) else None
+    right_knee_angle = safe_angle(right_hip, right_knee, right_ankle) if score_is_reliable(key_conf, [COCO_KEYPOINTS['right_hip'], COCO_KEYPOINTS['right_knee'], COCO_KEYPOINTS['right_ankle']]) else None
+    knee_angles = [angle for angle in [left_knee_angle, right_knee_angle] if angle is not None]
+    avg_knee_flexion_deg = float(np.mean(knee_angles)) if knee_angles else None
+
+    head_offset_ratio = None
+    if score_is_reliable(key_conf, [COCO_KEYPOINTS['nose'], COCO_KEYPOINTS['left_hip'], COCO_KEYPOINTS['right_hip']]):
+        head_offset_ratio = float(abs(nose[0] - hip_center[0]) / max(box_width, 1.0))
+
+    low_ready = False
+    if avg_knee_flexion_deg is not None and avg_knee_flexion_deg < 155.0 and vertical_angle < 38.0:
+        low_ready = True
+
+    asymmetry_flag = shoulder_tilt_deg > 14.0 or hip_tilt_deg > 14.0
+    posture_label = 'upright' if is_upright else 'bent/crouched'
+    if low_ready and vertical_angle < 32.0:
+        posture_label = 'athletic_ready'
+
     return {
-        'posture': 'upright' if is_upright else 'bent/crouched',
+        'posture': posture_label,
         'balance': balance,
         'stance_width': stance_width,
         'height_ratio': float(box_height / max(box_width, 1.0)),
         'position_y': float(y1),
         'stance': stance,
+        'trunk_lean_deg': float(vertical_angle),
+        'shoulder_tilt_deg': shoulder_tilt_deg,
+        'hip_tilt_deg': hip_tilt_deg,
+        'avg_knee_flexion_deg': avg_knee_flexion_deg,
+        'head_offset_ratio': head_offset_ratio,
+        'low_ready': low_ready,
+        'asymmetry_flag': asymmetry_flag,
         'skeleton_confidence': float(np.mean(key_conf)),
         'keypoints': key_xy.tolist(),
         'keypoint_scores': key_conf.tolist(),
@@ -233,19 +303,8 @@ def compute_pose_features_from_keypoints(keypoints, box, frame_shape):
 def extract_pose_data(image, box, pose_results=None):
     """Extract pose information from actual skeleton keypoints or fallback to box shape."""
     if pose_results is not None:
-        best_index = None
-        best_iou = 0.0
-        for i, det_box in enumerate(pose_results['boxes']):
-            score = float(pose_results['scores'][i])
-            if score < 0.3:  # Lowered from 0.6
-                continue
-            det_box_tuple = tuple(map(float, det_box))
-            current_iou = box_iou(box, det_box_tuple)
-            if current_iou > best_iou:
-                best_iou = current_iou
-                best_index = i
-
-        if best_index is not None and best_iou > 0.1:  # Lowered from 0.15
+        best_index = find_best_pose_match(box, pose_results, min_score=0.3, min_iou=0.1)
+        if best_index is not None:
             keypoints = pose_results['keypoints'][best_index]
             pose_data = compute_pose_features_from_keypoints(keypoints, box, image.shape)
             if pose_data is not None:
@@ -265,6 +324,13 @@ def extract_pose_data(image, box, pose_results=None):
         'height_ratio': float(aspect_ratio),
         'position_y': float(y1),
         'stance': 'narrow' if box_width < 60 else 'wide' if box_width > 100 else 'moderate',
+        'trunk_lean_deg': 0.0 if is_upright else 35.0,
+        'shoulder_tilt_deg': None,
+        'hip_tilt_deg': None,
+        'avg_knee_flexion_deg': None,
+        'head_offset_ratio': None,
+        'low_ready': False,
+        'asymmetry_flag': False,
         'skeleton_confidence': 0.0,
     }
 
@@ -272,17 +338,25 @@ def extract_pose_data(image, box, pose_results=None):
 def init_hf_analyzer():
     global hf_analyzer
     if hf_analyzer is None:
-        try:
-            print("[INFO] Loading HF analyzer (FLAN-T5-small - fast & efficient)...")
-            # Use smaller, faster model optimized for speed
-            tokenizer = AutoTokenizer.from_pretrained('google/flan-t5-small')
-            model = AutoModelForSeq2SeqLM.from_pretrained('google/flan-t5-small')
-            model.cpu()  # Move to CPU without device_map
-            hf_analyzer = {'tokenizer': tokenizer, 'model': model}
-            print("[INFO] HF analyzer loaded successfully (CPU) - ~3x faster than base model")
-        except Exception as e:
-            print(f"[WARNING] HF analyzer not available, using rule-based feedback: {e}")
-            hf_analyzer = False
+        preferred_model = os.getenv('BADMINTON_AI_MODEL', 'google/flan-t5-base').strip() or 'google/flan-t5-base'
+        candidate_models = [preferred_model]
+        if preferred_model != 'google/flan-t5-small':
+            candidate_models.append('google/flan-t5-small')
+
+        for model_name in candidate_models:
+            try:
+                print(f"[INFO] Loading HF analyzer ({model_name})...")
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+                model.cpu()
+                hf_analyzer = {'tokenizer': tokenizer, 'model': model, 'model_name': model_name}
+                print(f"[INFO] HF analyzer loaded successfully: {model_name}")
+                return
+            except Exception as e:
+                print(f"[WARNING] Failed to load analyzer model {model_name}: {e}")
+
+        print("[WARNING] HF analyzer not available, using rule-based feedback")
+        hf_analyzer = False
 
 
 def is_valid_coaching_feedback(text, min_length=15):
@@ -319,8 +393,178 @@ def is_valid_coaching_feedback(text, min_length=15):
     return has_coaching_content
 
 
+def format_percent(value):
+    return f"{value * 100:.0f}%"
+
+
+def format_optional_metric(value, suffix="", digits=1):
+    if value is None:
+        return "n/a"
+    return f"{value:.{digits}f}{suffix}"
+
+
+def build_ai_coaching_prompt(player, question, profile, pose_metrics, box_metrics, feedback_data, summary_report):
+    strengths = feedback_data.get('strengths', [])
+    weaknesses = feedback_data.get('weaknesses', [])
+    drills = feedback_data.get('drills', [])
+
+    prompt = f"""
+You are a badminton coach writing a short performance review from skeleton-analysis metrics.
+Stay grounded in the provided measurements. Do not invent shots, scores, rallies, handedness, or match context.
+Prioritize skeleton observations over generic movement commentary.
+Write a long, structured coaching response with these section titles:
+Technical Snapshot
+What Looks Good
+What Needs Work
+Specific Drills
+Next Step For This Player
+Each section should contain 2-4 complete sentences or bullet points.
+Use plain coaching language. Be specific and practical.
+
+Player: {player}
+Optional user question: {question or 'none'}
+Dominant profile: posture={profile.get('posture', 'unknown')}, balance={profile.get('balance', 'unknown')}, stance={profile.get('stance', 'unknown')}
+
+Skeleton metrics:
+- upright ratio: {format_percent(pose_metrics.get('upright_ratio', 0.0))}
+- athletic ready ratio: {format_percent(pose_metrics.get('athletic_ready_ratio', 0.0))}
+- centred balance ratio: {format_percent(pose_metrics.get('centred_ratio', 0.0))}
+- wide stance ratio: {format_percent(pose_metrics.get('wide_ratio', 0.0))}
+- avg trunk lean: {format_optional_metric(pose_metrics.get('avg_trunk_lean_deg'), ' deg')}
+- avg shoulder tilt: {format_optional_metric(pose_metrics.get('avg_shoulder_tilt_deg'), ' deg')}
+- avg hip tilt: {format_optional_metric(pose_metrics.get('avg_hip_tilt_deg'), ' deg')}
+- avg knee flexion: {format_optional_metric(pose_metrics.get('avg_knee_flexion_deg'), ' deg')}
+- low ready ratio: {format_percent(pose_metrics.get('low_ready_ratio', 0.0))}
+- asymmetry ratio: {format_percent(pose_metrics.get('asymmetry_ratio', 0.0))}
+- skeleton confidence: {pose_metrics.get('avg_skeleton_confidence', 0.0):.2f}
+
+Movement metrics:
+- tracked frames: {box_metrics.get('frames', 0)}
+- avg step size: {box_metrics.get('avg_step_px', 0.0):.1f}px
+- movement consistency: {box_metrics.get('movement_consistency', 0.0):.2f}
+- total movement: {box_metrics.get('total_movement_px', 0.0):.1f}px
+
+Rule-based strengths:
+{chr(10).join(f"- {item}" for item in strengths[:3]) if strengths else "- none"}
+
+Rule-based weaknesses:
+{chr(10).join(f"- {item}" for item in weaknesses[:3]) if weaknesses else "- none"}
+
+Recommended drills:
+{chr(10).join(f"- {item}" for item in drills[:3]) if drills else "- none"}
+
+Ground-truth summary:
+{summary_report}
+""".strip()
+    return prompt
+
+
+def build_pose_focus_commentary(player, profile, pose_metrics, box_metrics, feedback_data, question=""):
+    posture = profile.get('posture', 'unknown')
+    balance = profile.get('balance', 'unknown')
+    stance = profile.get('stance', 'unknown')
+    upright_ratio = pose_metrics.get('upright_ratio', 0.0)
+    athletic_ready_ratio = pose_metrics.get('athletic_ready_ratio', 0.0)
+    low_ready_ratio = pose_metrics.get('low_ready_ratio', 0.0)
+    asymmetry_ratio = pose_metrics.get('asymmetry_ratio', 0.0)
+    trunk_lean = pose_metrics.get('avg_trunk_lean_deg')
+    shoulder_tilt = pose_metrics.get('avg_shoulder_tilt_deg')
+    hip_tilt = pose_metrics.get('avg_hip_tilt_deg')
+    knee_flexion = pose_metrics.get('avg_knee_flexion_deg')
+    avg_step = box_metrics.get('avg_step_px', 0.0)
+    movement_consistency = box_metrics.get('movement_consistency', 0.0)
+
+    technical_snapshot = [
+        f"{player}'s tracked skeleton profile currently reads as {posture} posture, {balance} balance, and a {stance} stance.",
+        f"The pose sample shows {format_percent(upright_ratio)} upright frames and {format_percent(athletic_ready_ratio)} frames in an athletic ready position.",
+        f"Average trunk lean is {format_optional_metric(trunk_lean, ' deg')}, shoulder tilt is {format_optional_metric(shoulder_tilt, ' deg')}, and hip tilt is {format_optional_metric(hip_tilt, ' deg')}.",
+    ]
+
+    issue_parts = []
+    if asymmetry_ratio >= 0.35:
+        issue_parts.append(
+            f"Upper- and lower-body alignment is inconsistent, with asymmetry appearing in {format_percent(asymmetry_ratio)} of the pose frames"
+        )
+    if shoulder_tilt is not None and shoulder_tilt > 10.0:
+        issue_parts.append(f"the shoulders are tilting by about {shoulder_tilt:.1f} degrees")
+    if hip_tilt is not None and hip_tilt > 10.0:
+        issue_parts.append(f"the hips are tilting by about {hip_tilt:.1f} degrees")
+    if knee_flexion is not None and knee_flexion > 160.0:
+        issue_parts.append(f"the legs are often too straight at roughly {knee_flexion:.1f} degrees")
+    if low_ready_ratio < 0.35:
+        issue_parts.append("the player is not getting into a low ready base often enough")
+    if movement_consistency < 0.55:
+        issue_parts.append(f"movement timing is only moderately repeatable at {movement_consistency:.2f}")
+
+    if not issue_parts:
+        issue_parts.append("the main next step is making the current skeleton shape more repeatable from frame to frame")
+
+    strengths = []
+    if upright_ratio >= 0.55:
+        strengths.append("The upper body is staying reasonably organized through a good portion of the tracked frames.")
+    if athletic_ready_ratio >= 0.30 or low_ready_ratio >= 0.40:
+        strengths.append("The player is reaching a usable ready position often enough to build on.")
+    if movement_consistency >= 0.6:
+        strengths.append(f"Movement timing is fairly repeatable at {movement_consistency:.2f}, which is a useful foundation for footwork work.")
+    if avg_step >= 12:
+        strengths.append(f"Average step size is {avg_step:.1f}px, so there is already some court coverage to work with.")
+    if not strengths:
+        strengths.append("The clip still gives a useful baseline, even if the current technique is not yet stable.")
+
+    drills = feedback_data.get('drills', [])
+    improvement = feedback_data.get('improvements', ['Better pose repeatability should translate into cleaner footwork.'])[0]
+    drill_1 = drills[0] if drills else "Shadow footwork with a chest-up posture check every third movement."
+    drill_2 = drills[1] if len(drills) > 1 else "Split-step to lunge recovery work with a pause in the ready position."
+    weakness_summary = (
+        "The biggest technical issue from the skeleton data is that "
+        + ", ".join(issue_parts[:3])
+        + ". This matters because unstable posture and base shape make it harder to push explosively into the next shot and recover cleanly to center."
+    )
+
+    question_lower = question.lower()
+    question_focus = "Use the skeleton findings as the main reference point for the next practice block."
+    if "smash" in question_lower:
+        question_focus = (
+            "For the smash specifically, the body line has to stay tall enough for full shoulder rotation while the legs remain loaded underneath. "
+            "If the chest collapses or the base gets too narrow, power leaks before contact."
+        )
+    elif "footwork" in question_lower or "movement" in question_lower:
+        question_focus = (
+            "For footwork, the goal is not just moving more. The goal is reaching the shuttle from a balanced base and recovering without losing trunk shape."
+        )
+    elif "posture" in question_lower or "balance" in question_lower:
+        question_focus = (
+            "For posture and balance, the main win is keeping the chest organized above the hips instead of letting the body tip and twist through each plant."
+        )
+
+    sections = [
+        "Technical Snapshot\n"
+        + "\n".join(f"- {item}" for item in technical_snapshot),
+        "What Looks Good\n"
+        + "\n".join(f"- {item}" for item in strengths[:4]),
+        "What Needs Work\n"
+        + "\n".join([
+            f"- {weakness_summary}",
+            f"- The player is currently averaging {avg_step:.1f}px per step with movement consistency at {movement_consistency:.2f}, so the target is cleaner shape without losing coverage.",
+        ]),
+        "Specific Drills\n"
+        + "\n".join([
+            f"- {drill_1}",
+            f"- {drill_2}",
+            "- Film the next drill block from the same camera angle so the posture changes can be compared directly.",
+        ]),
+        "Next Step For This Player\n"
+        + "\n".join([
+            f"- {question_focus}",
+            f"- Expected improvement if this is cleaned up: {improvement}",
+        ]),
+    ]
+
+    return "\n\n".join(sections)
+
+
 def generate_structured_feedback(prompt, max_new_tokens=300):
-    """Generate coaching feedback with simpler, more reliable prompts."""
+    """Generate coaching feedback with a constrained, metrics-aware prompt."""
     try:
         if hf_analyzer is None:
             init_hf_analyzer()
@@ -330,53 +574,35 @@ def generate_structured_feedback(prompt, max_new_tokens=300):
 
         tokenizer = hf_analyzer['tokenizer']
         model = hf_analyzer['model']
-
-        # Simplify prompt to avoid model confusion
-        simple_prompt = (
-            "Provide badminton coaching feedback. "
-            "Focus on technique, posture, movement, and drills. "
-            "Be direct and actionable. "
-            "Do not mention instructions or ask questions."
-        )
-        
-        if prompt and len(prompt) > 50:
-            # Extract key info from full prompt
-            if 'posture' in prompt.lower():
-                simple_prompt += f" The player has issues with posture. "
-            if 'balance' in prompt.lower():
-                simple_prompt += f" Focus on improving balance and weight transfer. "
-            if 'movement' in prompt.lower():
-                simple_prompt += f" Improve movement consistency and footwork. "
-
-        inputs = tokenizer(simple_prompt, return_tensors='pt', max_length=256, truncation=True)
+        inputs = tokenizer(prompt, return_tensors='pt', max_length=512, truncation=True)
         
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            num_beams=1,  # Simpler generation
-            early_stopping=True,
+            do_sample=False,
+            num_beams=4,
             no_repeat_ngram_size=3,
             repetition_penalty=1.2,
+            length_penalty=1.0,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
         )
         
         result = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        
-        # Clean up output
-        if result.lower().startswith(simple_prompt[:30].lower()):
-            result = result[len(simple_prompt):].strip()
-        
-        # Remove prompt echo
-        for phrase in ['provide badminton', 'focus on', 'do not mention']:
-            if result.lower().startswith(phrase):
-                idx = result.lower().find(phrase) + len(phrase)
-                result = result[idx:].strip()
-                break
-        
+
+        lowered = result.lower()
+        for leak in [
+            "you are a badminton coach",
+            "write a long, structured coaching response",
+            "skeleton metrics:",
+            "movement metrics:",
+            "rule-based strengths:",
+            "recommended drills:",
+            "ground-truth summary:",
+        ]:
+            if leak in lowered:
+                return None
+
         return result if result else None
         
     except Exception as e:
@@ -402,6 +628,16 @@ def summarize_pose_metrics(poses):
             "vertical_mobility": 0.0,
             "balance_switch_rate": 0.0,
             "stance_switch_rate": 0.0,
+            "athletic_ready_ratio": 0.0,
+            "low_ready_ratio": 0.0,
+            "asymmetry_ratio": 0.0,
+            "avg_trunk_lean_deg": None,
+            "avg_shoulder_tilt_deg": None,
+            "avg_hip_tilt_deg": None,
+            "avg_knee_flexion_deg": None,
+            "avg_head_offset_ratio": None,
+            "avg_skeleton_confidence": 0.0,
+            "skeleton_frame_ratio": 0.0,
         }
 
     postures = [p.get("posture", "unknown") for p in valid]
@@ -410,6 +646,13 @@ def summarize_pose_metrics(poses):
     heights = np.array([float(p.get("height_ratio", 0.0)) for p in valid], dtype=float)
     widths = np.array([float(p.get("stance_width", 0.0)) for p in valid], dtype=float)
     y_positions = np.array([float(p.get("position_y", 0.0)) for p in valid], dtype=float)
+    trunk_leans = [float(p.get("trunk_lean_deg")) for p in valid if p.get("trunk_lean_deg") is not None]
+    shoulder_tilts = [float(p.get("shoulder_tilt_deg")) for p in valid if p.get("shoulder_tilt_deg") is not None]
+    hip_tilts = [float(p.get("hip_tilt_deg")) for p in valid if p.get("hip_tilt_deg") is not None]
+    knee_flexions = [float(p.get("avg_knee_flexion_deg")) for p in valid if p.get("avg_knee_flexion_deg") is not None]
+    head_offsets = [float(p.get("head_offset_ratio")) for p in valid if p.get("head_offset_ratio") is not None]
+    skeleton_confidences = [float(p.get("skeleton_confidence", 0.0)) for p in valid]
+    skeleton_supported = [p for p in valid if float(p.get("skeleton_confidence", 0.0)) > 0.05]
 
     def switch_rate(items):
         if len(items) < 2:
@@ -430,6 +673,16 @@ def summarize_pose_metrics(poses):
         "vertical_mobility": float(np.std(y_positions)),
         "balance_switch_rate": float(switch_rate(balances)),
         "stance_switch_rate": float(switch_rate(stances)),
+        "athletic_ready_ratio": postures.count("athletic_ready") / n,
+        "low_ready_ratio": sum(1 for p in valid if p.get("low_ready")) / n,
+        "asymmetry_ratio": sum(1 for p in valid if p.get("asymmetry_flag")) / n,
+        "avg_trunk_lean_deg": float(np.mean(trunk_leans)) if trunk_leans else None,
+        "avg_shoulder_tilt_deg": float(np.mean(shoulder_tilts)) if shoulder_tilts else None,
+        "avg_hip_tilt_deg": float(np.mean(hip_tilts)) if hip_tilts else None,
+        "avg_knee_flexion_deg": float(np.mean(knee_flexions)) if knee_flexions else None,
+        "avg_head_offset_ratio": float(np.mean(head_offsets)) if head_offsets else None,
+        "avg_skeleton_confidence": float(np.mean(skeleton_confidences)) if skeleton_confidences else 0.0,
+        "skeleton_frame_ratio": len(skeleton_supported) / n,
     }
 
 
@@ -471,7 +724,7 @@ def compute_box_metrics(boxes):
 
 
 def build_rule_based_player_feedback(player, posture, balance, stance, height_ratio, pose_metrics, box_metrics):
-    """Deterministic coaching text based on computed video metrics - improved version with better filtering."""
+    """Deterministic coaching text with skeleton metrics taking priority."""
     strengths = []
     weaknesses = []
     drills = []
@@ -483,32 +736,67 @@ def build_rule_based_player_feedback(player, posture, balance, stance, height_ra
     stance_switch_rate = pose_metrics.get("stance_switch_rate", 0.0)
     balance_switch_rate = pose_metrics.get("balance_switch_rate", 0.0)
     vertical_mobility = pose_metrics.get("vertical_mobility", 0.0)
+    athletic_ready_ratio = pose_metrics.get("athletic_ready_ratio", 0.0)
+    low_ready_ratio = pose_metrics.get("low_ready_ratio", 0.0)
+    asymmetry_ratio = pose_metrics.get("asymmetry_ratio", 0.0)
+    trunk_lean = pose_metrics.get("avg_trunk_lean_deg")
+    shoulder_tilt = pose_metrics.get("avg_shoulder_tilt_deg")
+    hip_tilt = pose_metrics.get("avg_hip_tilt_deg")
+    knee_flexion = pose_metrics.get("avg_knee_flexion_deg")
+    skeleton_confidence = pose_metrics.get("avg_skeleton_confidence", 0.0)
+    skeleton_frame_ratio = pose_metrics.get("skeleton_frame_ratio", 0.0)
     movement_consistency = box_metrics.get("movement_consistency", 0.0)
     avg_step = box_metrics.get("avg_step_px", 0.0)
     samples = pose_metrics.get("samples", 0)
     frames = box_metrics.get("frames", 0)
 
     # START with frame/sample count - always relevant
-    strengths.append(f"Observed {samples} pose frames and {frames} tracking samples.")
+    strengths.append(
+        f"Observed {samples} pose frames and {frames} tracking samples, with skeleton support on {format_percent(skeleton_frame_ratio)} of usable frames."
+    )
+    if skeleton_confidence >= 0.45:
+        strengths.append(f"Skeleton confidence is solid at {skeleton_confidence:.2f}, so the posture read is reasonably trustworthy.")
 
-    # POSTURE ANALYSIS - only include if there's meaningful signal
+    # SKELETON-DRIVEN POSTURE ANALYSIS
+    if athletic_ready_ratio >= 0.35 or low_ready_ratio >= 0.45:
+        strengths.append("Frequently reaches an athletic ready shape, which should help push-off speed and recovery.")
+    elif knee_flexion is not None and knee_flexion > 160.0:
+        weaknesses.append("The skeleton shows a tall base with limited knee bend, so the ready position is too high for quick first steps.")
+        drills.append("Split-step to hold drill: 4x20s, pause in a lower loaded base before each push-off.")
+
     if upright_ratio >= 0.6:
-        strengths.append("Maintains upright posture, supporting sustained court presence.")
+        strengths.append("Maintains a stable trunk through many frames, supporting sustained court presence.")
     elif upright_ratio >= 0.4:
-        strengths.append("Shows mixed posture control; strengthen chest position for better anticipation.")
+        weaknesses.append("Posture control is mixed; the trunk angle changes too often instead of staying stable through recovery.")
+        drills.append("Shadow rally with chest-up checkpoints every third movement for 4x40s.")
     else:
-        # Only include if significantly crouched
-        weaknesses.append("Body alignment is consistently bent; focus on verticality to prevent fatigue accumulation.")
+        weaknesses.append("Body alignment is consistently collapsed forward; focus on a taller chest while keeping the legs loaded.")
         drills.append("Wall-assisted posture resets: 3x15s, reset to neutral spine between movements.")
+
+    if trunk_lean is not None and trunk_lean > 28.0:
+        weaknesses.append(f"Average trunk lean is {trunk_lean:.1f} degrees, which suggests the upper body is tipping too far instead of stacking over the base.")
+    elif trunk_lean is not None and trunk_lean < 18.0:
+        strengths.append(f"Average trunk lean stays controlled at {trunk_lean:.1f} degrees.")
 
     # BALANCE ANALYSIS - meaningful thresholds
     if centred_ratio >= 0.65:
         strengths.append("Excellent center balance preservation across movement transitions.")
     elif centred_ratio >= 0.45:
-        strengths.append("Moderate center balance; build midline awareness during rapid directional changes.")
+        weaknesses.append("Center balance is decent but not yet reliable under change of direction.")
     elif centred_ratio < 0.35:
         weaknesses.append("Center balance is inconsistent; practice weighted recovery to base position.")
         drills.append("Single-leg balance holds: 3x10s each leg, then side-to-side recovery.")
+
+    if asymmetry_ratio >= 0.35:
+        weaknesses.append("Shoulder and hip levels are uneven too often, which can reduce movement efficiency and hitting stability.")
+        drills.append("Mirror shadow footwork: 3x30s, keep shoulders and hips level through each plant.")
+    elif asymmetry_ratio <= 0.18 and shoulder_tilt is not None and hip_tilt is not None:
+        strengths.append("Shoulder and hip alignment stay relatively level during most tracked poses.")
+
+    if shoulder_tilt is not None and shoulder_tilt > 12.0:
+        weaknesses.append(f"Shoulder tilt averages {shoulder_tilt:.1f} degrees, so upper-body control is leaking during movement.")
+    if hip_tilt is not None and hip_tilt > 12.0:
+        weaknesses.append(f"Hip tilt averages {hip_tilt:.1f} degrees, which points to unstable loading on directional pushes.")
 
     # STANCE WIDTH ANALYSIS - only flag when problematic
     if wide_ratio >= 0.7:
@@ -549,9 +837,11 @@ def build_rule_based_player_feedback(player, posture, balance, stance, height_ra
 
     # Build improvements based on what was flagged
     if weaknesses:
+        if any("knee" in w.lower() or "ready" in w.lower() or "trunk" in w.lower() for w in weaknesses):
+            improvements.append("A cleaner ready position should improve first-step explosiveness without sacrificing stability.")
         if any("balance" in w.lower() for w in weaknesses):
             improvements.append("Improved weight transfer will reduce errors on direction changes.")
-        if any("stance" in w.lower() or "posture" in w.lower() or "vertical" in w.lower() for w in weaknesses):
+        if any("stance" in w.lower() or "posture" in w.lower() or "vertical" in w.lower() or "shoulder" in w.lower() or "hip" in w.lower() for w in weaknesses):
             improvements.append("Better postural stability extends rally-duration endurance.")
         if any("step" in w.lower() or "movement" in w.lower() for w in weaknesses):
             improvements.append("More consistent footwork patterns accelerate first-step response time.")
@@ -591,10 +881,16 @@ def build_player_analysis_report(player, dominant_posture, dominant_balance, dom
     movement_consistency = box_metrics.get('movement_consistency', 0.0)
     avg_step = box_metrics.get('avg_step_px', 0.0)
     upright_ratio = pose_metrics.get('upright_ratio', 0.0)
+    athletic_ready_ratio = pose_metrics.get('athletic_ready_ratio', 0.0)
     centred_ratio = pose_metrics.get('centred_ratio', 0.0)
     balance_switch_rate = pose_metrics.get('balance_switch_rate', 0.0)
     stance_switch_rate = pose_metrics.get('stance_switch_rate', 0.0)
     vertical_mobility = pose_metrics.get('vertical_mobility', 0.0)
+    asymmetry_ratio = pose_metrics.get('asymmetry_ratio', 0.0)
+    trunk_lean = pose_metrics.get('avg_trunk_lean_deg')
+    shoulder_tilt = pose_metrics.get('avg_shoulder_tilt_deg')
+    hip_tilt = pose_metrics.get('avg_hip_tilt_deg')
+    knee_flexion = pose_metrics.get('avg_knee_flexion_deg')
 
     strengths = feedback_data.get('strengths', [])
     weaknesses = feedback_data.get('weaknesses', [])
@@ -607,6 +903,15 @@ def build_player_analysis_report(player, dominant_posture, dominant_balance, dom
         f"The height ratio is {avg_height:.2f}, which is consistent with current movement style."
     )
 
+    if athletic_ready_ratio >= 0.35:
+        summary.append(
+            f"The skeleton data shows an athletic ready position in {athletic_ready_ratio:.2f} of frames, which is a positive sign for push-off readiness."
+        )
+    elif knee_flexion is not None:
+        summary.append(
+            f"The average knee angle is {knee_flexion:.1f} degrees, suggesting the ready base could be loaded more consistently."
+        )
+
     if upright_ratio >= 0.6:
         summary.append(
             f"Upright posture is a relative strength ({upright_ratio:.2f} of frames upright), which supports higher court coverage and reduces fatigue."
@@ -618,6 +923,16 @@ def build_player_analysis_report(player, dominant_posture, dominant_balance, dom
     else:
         summary.append(
             f"Posture is a key weakness: only {upright_ratio:.2f} of frames are upright. The player should focus on raising the body line during rallies."
+        )
+
+    if trunk_lean is not None:
+        summary.append(
+            f"Average trunk lean is {trunk_lean:.1f} degrees, which helps quantify how much the body is tipping forward through movement."
+        )
+    if shoulder_tilt is not None or hip_tilt is not None:
+        summary.append(
+            f"Alignment is being tracked through shoulder tilt ({format_optional_metric(shoulder_tilt, ' deg')}) and hip tilt ({format_optional_metric(hip_tilt, ' deg')}). "
+            f"Asymmetry appears in {asymmetry_ratio:.2f} of frames."
         )
 
     if centred_ratio >= 0.6:
@@ -653,6 +968,17 @@ def build_player_analysis_report(player, dominant_posture, dominant_balance, dom
     else:
         summary.append(
             f"Average step size is small ({avg_step:.1f}px). Increasing step length while maintaining balance will improve reach and recovery."
+        )
+
+    if balance_switch_rate > 0.5 or stance_switch_rate > 0.6:
+        summary.append(
+            f"The skeleton and tracking signals show frequent base changes, with balance switching at {balance_switch_rate:.2f} and stance switching at {stance_switch_rate:.2f}. "
+            "That usually means the player is reacting after landing instead of moving from a stable base."
+        )
+
+    if vertical_mobility > 100:
+        summary.append(
+            f"Vertical movement varies by {vertical_mobility:.1f}px, which may indicate extra bounce rather than efficient glide steps."
         )
 
     if weaknesses:
@@ -750,6 +1076,28 @@ def center_distance(box_a, box_b):
     ax, ay = box_center(box_a)
     bx, by = box_center(box_b)
     return float(np.sqrt((ax - bx) ** 2 + (ay - by) ** 2))
+
+
+def find_best_pose_match(box, pose_results, min_score=0.2, min_iou=0.1):
+    """Find the pose detection that best overlaps a tracked person box."""
+    if pose_results is None:
+        return None
+
+    best_index = None
+    best_iou = 0.0
+    for i, det_box in enumerate(pose_results.get('boxes', [])):
+        score = float(pose_results['scores'][i])
+        if score < min_score:
+            continue
+        det_box_tuple = tuple(map(float, det_box))
+        current_iou = box_iou(box, det_box_tuple)
+        if current_iou > best_iou:
+            best_iou = current_iou
+            best_index = i
+
+    if best_index is None or best_iou < min_iou:
+        return None
+    return best_index
 
 
 def assign_detections_to_tracks(track_state, detections, max_distance=140.0):
@@ -986,10 +1334,25 @@ def detect_humans():
                 "metrics": {},
             }
 
-        # Draw first frame with all detections (NO skeleton - just boxes)
+        # Draw first frame with detections and full skeleton overlays when available.
         frame_with_boxes = frame.copy()
+        pose_results = None
+        try:
+            pose_results = run_skeleton_detector(frame)
+        except Exception as pose_draw_err:
+            print(f"[WARNING] preview pose drawing failed: {pose_draw_err}")
+
         for idx, (x1, y1, x2, y2) in enumerate(detections, start=1):
             label = f"Player{idx}"
+            pose_index = find_best_pose_match((x1, y1, x2, y2), pose_results, min_score=0.2, min_iou=0.1)
+            if pose_index is not None:
+                draw_skeleton(
+                    frame_with_boxes,
+                    pose_results['keypoints'][pose_index][:, :2],
+                    pose_results['keypoints'][pose_index][:, 2],
+                    score_thresh=0.25,
+                    color=(0, 220, 255),
+                )
             cv2.rectangle(frame_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame_with_boxes, label, (x1, max(y1 - 10, 10)),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -1299,20 +1662,52 @@ def analyze_player():
                 feedback_data,
             )
 
-            # Generate AI commentary with much simpler, more reliable approach
+            # Generate AI commentary from the actual skeleton metrics
             init_hf_analyzer()
-            ai_commentary = ""
+            ai_commentary = build_pose_focus_commentary(
+                player,
+                {
+                    'posture': dominant_posture,
+                    'balance': dominant_balance,
+                    'stance': dominant_stance,
+                    'height_ratio': avg_height,
+                },
+                pose_metrics,
+                box_metrics,
+                feedback_data,
+            )
             if hf_analyzer and hf_analyzer is not False:
-                simple_ai_prompt = (
-                    f"Write coaching feedback for a badminton player. "
-                    f"Focus on: {focus_str}. "
-                    f"Include specific drills and expected improvements. "
-                    f"Be professional and encouraging."
+                simple_ai_prompt = build_ai_coaching_prompt(
+                    player,
+                    f"Focus on {focus_str}.",
+                    {
+                        'posture': dominant_posture,
+                        'balance': dominant_balance,
+                        'stance': dominant_stance,
+                        'height_ratio': avg_height,
+                    },
+                    pose_metrics,
+                    box_metrics,
+                    feedback_data,
+                    summary_report,
                 )
-                ai_commentary = generate_structured_feedback(simple_ai_prompt, max_new_tokens=400)
+                generated_commentary = generate_structured_feedback(simple_ai_prompt, max_new_tokens=220)
+                if generated_commentary and is_valid_coaching_feedback(generated_commentary):
+                    ai_commentary = generated_commentary
 
             if not ai_commentary or not is_valid_coaching_feedback(ai_commentary):
-                ai_commentary = summary_report
+                ai_commentary = build_pose_focus_commentary(
+                    player,
+                    {
+                        'posture': dominant_posture,
+                        'balance': dominant_balance,
+                        'stance': dominant_stance,
+                        'height_ratio': avg_height,
+                    },
+                    pose_metrics,
+                    box_metrics,
+                    feedback_data,
+                )
 
         # Save context for follow-up questions
         player_analysis_context[player] = {
@@ -1327,6 +1722,7 @@ def analyze_player():
             'feedback': feedback_data,
             'summary': feedback_text,
             'ai_commentary': ai_commentary,
+            'ai_model': hf_analyzer.get('model_name') if hf_analyzer and hf_analyzer is not False else 'rule_based_pose_summary',
         }
 
         result = f"""
@@ -1407,20 +1803,20 @@ def player_chat():
         print(f"[LOG] 4. All validation passed")
         ctx = player_analysis_context[player]
         profile = ctx.get('profile', {})
+        pose_metrics = ctx.get('pose_metrics', {})
+        box_metrics = ctx.get('box_metrics', {})
+        feedback_data = ctx.get('feedback', {})
         print(f"[LOG] 5. Profile extracted: {profile}")
         
-        # Simple, direct prompt for the chatbot
-        prompt = (
-            "You are an expert badminton coach. "
-            f"Player profile: posture={profile.get('posture', 'unknown')}, "
-            f"balance={profile.get('balance', 'unknown')}, stance={profile.get('stance', 'unknown')}. "
-            f"Upright ratio={ctx.get('pose_metrics', {}).get('upright_ratio', 0):.0%}, "
-            f"centered balance={ctx.get('pose_metrics', {}).get('centred_ratio', 0):.0%}, "
-            f"step consistency={ctx.get('box_metrics', {}).get('movement_consistency', 0):.2f}. "
-            f"The user asks: {question}\n\n"
-            "Reply in 4-6 complete sentences with specific drills, corrections, and encouragement. "
-            "Do not repeat the question or the prompt text."
-        )
+        prompt = build_ai_coaching_prompt(
+            player,
+            question,
+            profile,
+            pose_metrics,
+            box_metrics,
+            feedback_data,
+            ctx.get('ai_commentary', '') or ctx.get('summary', ''),
+        ) + "\n\nAnswer the user question directly while staying consistent with the measurements above."
         print(f"[LOG] 6. Prompt prepared, calling generate_structured_feedback...")
         
         try:
@@ -1434,7 +1830,9 @@ def player_chat():
 
         if not reply or not is_valid_coaching_feedback(reply):
             print("[LOG] 8. Using deterministic fallback chat response")
-            reply = build_rule_based_chat_reply(player, question)
+            reply = build_pose_focus_commentary(player, profile, pose_metrics, box_metrics, feedback_data, question=question)
+            if question:
+                reply = reply + "\n\nAdditional Answer To Your Question\n- " + build_rule_based_chat_reply(player, question)
 
         print(f"[LOG] 9. Returning response")
         result = jsonify({

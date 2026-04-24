@@ -27,7 +27,7 @@
   {% if players %}
     <div class="card preview-card">
       <h2>Detected Frame (Frame 1)</h2>
-      <p class="note">All detected players are shown in boxes. Green box = skeleton visible</p>
+      <p class="note">Detected players are boxed, and when pose data is available the full skeleton is drawn directly on the player.</p>
       {% if preview %}
         <img src="data:image/jpeg;base64,{{ preview }}" alt="Detected video frame">
       {% else %}
@@ -114,15 +114,15 @@
               `<strong>Centered ratio:</strong> ${Math.round((poseMetrics.centred_ratio || 0) * 100)}% &nbsp;|&nbsp; ` +
               `<strong>Balance switch rate:</strong> ${poseMetrics.balance_switch_rate?.toFixed(2) || '0.00'}
             `);
-            metricBox.style.display = 'block';
+             metricBox.style.display = 'block';
           } else {
-            metricBox.style.display = 'none';
+             metricBox.style.display = 'none';
           }
           if (data.ai_commentary) {
-            commentaryText.textContent = data.ai_commentary;
-            commentaryBox.style.display = 'block';
+             commentaryText.innerHTML = formatStructuredText(data.ai_commentary);
+             commentaryBox.style.display = 'block';
           } else {
-            commentaryBox.style.display = 'none';
+             commentaryBox.style.display = 'none';
           }
           analyzeStatus.textContent = 'Analysis complete. You can continue to the coach module.';
           continueBtn.disabled = false;
@@ -139,6 +139,30 @@
       continueBtn.addEventListener('click', () => {
         window.location.href = '/coach';
       });
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function formatStructuredText(text) {
+      if (!text) return '';
+      const escaped = escapeHtml(text);
+      const blocks = escaped.split(/\n\s*\n/).filter(Boolean);
+      return blocks.map(block => {
+        const lines = block.split('\n').filter(Boolean);
+        if (!lines.length) return '';
+        if (lines.every(line => line.trim().startsWith('- '))) {
+          return `<ul>${lines.map(line => `<li>${line.trim().slice(2)}</li>`).join('')}</ul>`;
+        }
+        const [firstLine, ...rest] = lines;
+        if (rest.length && rest.every(line => line.trim().startsWith('- '))) {
+          return `<div class="structured-block"><strong>${firstLine.trim()}</strong><ul>${rest.map(line => `<li>${line.trim().slice(2)}</li>`).join('')}</ul></div>`;
+        }
+        return `<p>${lines.join('<br>')}</p>`;
+      }).join('');
     }
   </script>
 {% endblock %}
