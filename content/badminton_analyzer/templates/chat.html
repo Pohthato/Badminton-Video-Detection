@@ -21,8 +21,10 @@
               <option value="{{ player }}">{{ player }}</option>
             {% endfor %}
           </select>
-          <input id="chatInput" type="text" placeholder="Ask the coach anything about this player...">
           <button id="chatBtn" class="btn-primary">Ask</button>
+        </div>
+        <div class="form-row" style="margin-top: 12px;">
+          <textarea id="chatInput" rows="3" placeholder="Enter your coaching question here, just like ChatGPT."></textarea>
         </div>
       </div>
 
@@ -131,6 +133,19 @@
 
     .chat-window::-webkit-scrollbar-thumb:hover {
       background: #94a3b8;
+    }
+
+    .form-row textarea {
+      width: 100%;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 14px;
+      resize: vertical;
+      min-height: 90px;
+      line-height: 1.4;
+      background: #fff;
+      color: #1f2937;
     }
 
     .btn-primary {

@@ -2,3 +2,7 @@ venv/
 __pycache__/
 *.pyc
 content/badminton_analyzer/uploads/
+content/_zip_check/
+badminton_analyzer_gpu_deployment.zip
+content/badminton_analyzer/badminton_analyzer_gpu_deployment.zip
+content/badminton_analyzer.zip

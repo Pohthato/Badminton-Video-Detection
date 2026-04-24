@@ -2,9 +2,9 @@
 {% block title %}Analyze Players | Badminton Analyzer{% endblock %}
 {% block content %}
   <div class="card">
-    <div class="hero-tag">Step 2: Analyze detected players</div>
+    <div class="hero-tag">Step 2: Select and Analyze Player</div>
     <h1>Player Analysis</h1>
-    <p class="lead">Select a detected player from the match and generate a detailed coaching report with posture, balance, and movement insights.</p>
+    <p class="lead">Select a player from the first frame and we'll track them through the entire video, then provide detailed coaching feedback.</p>
 
     {% if not players %}
       <div class="alert">No detections available yet. Upload a video first on the Upload page to analyze players.</div>
@@ -18,31 +18,36 @@
             <option value="{{ player }}">{{ player }}</option>
           {% endfor %}
         </select>
-        <button id="analyzeBtn">Analyze Selected Player</button>
+        <button id="analyzeBtn">Track & Analyze Selected Player</button>
       </div>
-      <div id="analyzeStatus" class="status">Detected players: {{ players|length }}. Select one and analyze.</div>
+      <div id="analyzeStatus" class="status">Detected {{ players|length }} players in frame 1. Select one to track and analyze!</div>
     {% endif %}
   </div>
 
   {% if players %}
     <div class="card preview-card">
-      <h2>Detected Frame</h2>
+      <h2>Detected Frame (Frame 1)</h2>
+      <p class="note">All detected players are shown in boxes. Green box = skeleton visible</p>
       {% if preview %}
         <img src="data:image/jpeg;base64,{{ preview }}" alt="Detected video frame">
       {% else %}
-        <div class="alert">No preview is available yet. Run detection again if needed.</div>
+        <div class="alert">No preview available. Run detection again if needed.</div>
       {% endif %}
     </div>
 
     <div class="card">
       <h2>Analysis Output</h2>
-      <div id="analysisOutput" class="output-box">Select a player and click Analyze to generate the report.</div>
-      <div id="commentaryBox" class="panel" style="display:none;">
+      <div id="analysisOutput" class="output-box">Select a player and click "Track & Analyze" to generate the report.</div>
+      <div id="metricBox" class="panel" style="display:none; margin-top:16px;">
+        <h3>Key Metrics</h3>
+        <div id="metricText" class="result-box"></div>
+      </div>
+      <div id="commentaryBox" class="panel" style="display:none; margin-top:16px;">
         <h3>AI Coach Commentary</h3>
         <div id="commentaryText" class="result-box"></div>
       </div>
       <div class="form-row" style="margin-top:22px;">
-        <button id="continueBtn" type="button" disabled>Continue to Coach</button>
+        <button id="continueBtn" type="button" disabled>Continue to Coach Chat</button>
       </div>
     </div>
   {% endif %}
@@ -52,6 +57,8 @@
     const playerSelect = document.getElementById('playerSelect');
     const analyzeStatus = document.getElementById('analyzeStatus');
     const analysisOutput = document.getElementById('analysisOutput');
+    const metricBox = document.getElementById('metricBox');
+    const metricText = document.getElementById('metricText');
     const commentaryBox = document.getElementById('commentaryBox');
     const commentaryText = document.getElementById('commentaryText');
     const continueBtn = document.getElementById('continueBtn');
@@ -60,25 +67,62 @@
       analyzeBtn.addEventListener('click', async () => {
         const player = playerSelect.value;
         analyzeBtn.disabled = true;
-        analyzeStatus.textContent = 'Analyzing player metrics...';
+        playerSelect.disabled = true;
+        analyzeStatus.textContent = '🔄 Stage 1: Tracking selected player across entire video...';
         commentaryBox.style.display = 'none';
         commentaryText.textContent = '';
+        metricBox.style.display = 'none';
+        analysisOutput.innerHTML = '<em>Please wait - this may take a minute...</em>';
 
         try {
-          const response = await fetch('/analyze-player', {
+          // Stage 2: Track the selected player across the entire video
+          const trackResponse = await fetch('/track-selected-player', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ player })
           });
-          const data = await response.json();
-          if (!response.ok) {
+          const trackData = await trackResponse.json();
+          if (!trackResponse.ok) {
+            throw new Error(trackData.error || 'Tracking failed.');
+          }
+
+          analyzeStatus.textContent = `✓ Tracked ${trackData.frames_tracked} frames. Stage 2: Analyzing player...`;
+          analysisOutput.innerHTML = '<em>Generating analysis report...</em>';
+
+          // Stage 3: Analyze the tracked player
+          const analyzeResponse = await fetch('/analyze-player', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ player })
+          });
+          const data = await analyzeResponse.json();
+          if (!analyzeResponse.ok) {
             throw new Error(data.error || 'Analysis failed.');
           }
 
-          analysisOutput.textContent = data.analysis || 'No analysis returned.';
+          analyzeStatus.textContent = `✓ Analysis complete! ${trackData.frames_tracked} frames analyzed.`;
+          analysisOutput.innerHTML = (data.analysis || 'No analysis returned.').replace(/\n/g, '<br>');
+          
+          if (data.analysis_data && data.analysis_data.box_metrics) {
+            const metrics = data.analysis_data.box_metrics;
+            const poseMetrics = data.analysis_data.pose_metrics;
+            metricText.innerHTML = (
+              `<strong>Frames Tracked:</strong> ${metrics.frames || 0} &nbsp;|&nbsp; ` +
+              `<strong>Movement consistency:</strong> ${metrics.movement_consistency?.toFixed(2) || '0.00'}<br>` +
+              `<strong>Average step:</strong> ${metrics.avg_step_px?.toFixed(1) || '0.0'} px &nbsp;|&nbsp; ` +
+              `<strong>Upright ratio:</strong> ${Math.round((poseMetrics.upright_ratio || 0) * 100)}%<br>` +
+              `<strong>Centered ratio:</strong> ${Math.round((poseMetrics.centred_ratio || 0) * 100)}% &nbsp;|&nbsp; ` +
+              `<strong>Balance switch rate:</strong> ${poseMetrics.balance_switch_rate?.toFixed(2) || '0.00'}
+            `);
+            metricBox.style.display = 'block';
+          } else {
+            metricBox.style.display = 'none';
+          }
           if (data.ai_commentary) {
             commentaryText.textContent = data.ai_commentary;
             commentaryBox.style.display = 'block';
+          } else {
+            commentaryBox.style.display = 'none';
           }
           analyzeStatus.textContent = 'Analysis complete. You can continue to the coach module.';
           continueBtn.disabled = false;
